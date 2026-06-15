@@ -1,0 +1,8 @@
+.env
+.agent_data/
+__pycache__/
+*.pyc
+.idea/
+*.egg-info/
+dist/
+build/
