@@ -1,8 +1,32 @@
 """
-Calculator 工具 - 安全的数学表达式计算器
+============================================================
+Calculator 工具 — 安全的数学表达式计算器
+============================================================
 
-支持基本的四则运算、幂运算、取余等。
-使用 AST 解析确保安全性（不使用 eval）。
+核心设计：使用 Python AST（抽象语法树）解析而非 eval()。
+
+为什么不用 eval()：
+    eval() 可以执行任意 Python 代码，是安全黑洞。
+    例如 eval("__import__('os').system('rm -rf /')") 会执行系统命令。
+    AST 模式只解析表达式结构，不执行，从根本上杜绝了代码注入。
+
+实现原理：
+    1. ast.parse(expression, mode='eval') 将表达式解析为 AST
+       mode='eval' 限制为单一表达式，不能执行语句
+    2. 递归遍历 AST 节点
+    3. 只允许白名单中的运算符和函数
+    4. 遇到不允许的操作立即抛出异常
+
+安全措施：
+    - 白名单运算符：只有 +, -, *, /, //, %, ** 等基础运算符
+    - 白名单函数：只有 sqrt, sin, cos, tan, log, abs 等数学函数
+    - 幂运算限制：指数不得超过 1000（防止 DDOS）
+    - 纯函数：相同输入永远相同输出（可以放心缓存）
+
+支持的操作：
+    运算符: +, -, *, /, //, %, **, 一元 +/-,
+    函数: sqrt, sin, cos, tan, log, log10, abs, round, min, max
+    常量: pi, e
 """
 
 import ast
@@ -29,6 +53,7 @@ SAFE_OPERATORS = {
 
 # ============================================================
 # 安全数学函数白名单
+# 只有白名单中的函数允许在表达式中调用
 # ============================================================
 SAFE_FUNCTIONS = {
     "abs": abs,
@@ -41,20 +66,20 @@ SAFE_FUNCTIONS = {
     "sin": math.sin,
     "cos": math.cos,
     "tan": math.tan,
-    "pi": math.pi,
-    "e": math.e,
+    "pi": math.pi,      # 常量（非 callable）
+    "e": math.e,         # 常量（非 callable）
 }
 
 
 def _safe_eval(node: ast.AST) -> float:
     """
-    递归解析 AST 节点并安全计算数学表达式
+    递归解析 AST 节点并安全计算数学表达式。
 
     工作原理：
-    1. 将表达式字符串解析为 Python AST（抽象语法树）
-    2. 递归遍历 AST 节点
-    3. 只允许白名单中的运算符和函数
-    4. 遇到不允许的操作立即抛出异常
+    1. 接收 AST 节点
+    2. 根据节点类型（数字常量/二元运算/函数调用等）分派处理
+    3. 递归计算子节点
+    4. 只允许白名单中的运算
 
     Args:
         node: AST 节点
@@ -65,25 +90,25 @@ def _safe_eval(node: ast.AST) -> float:
     Raises:
         ValueError: 遇到不支持的操作
     """
-    # 数字常量节点（如 3, 3.14）
+    # ---- 数字常量节点（如 3, 3.14） ----
     if isinstance(node, ast.Constant):
         if isinstance(node.value, (int, float)):
             return float(node.value)
         raise ValueError(f"不支持的常量类型: {type(node.value).__name__}")
 
-    # 二元运算节点（如 3 + 4, 2 ** 10）
+    # ---- 二元运算节点（如 3 + 4, 2 ** 10） ----
     if isinstance(node, ast.BinOp):
         op_type = type(node.op)
         if op_type not in SAFE_OPERATORS:
             raise ValueError(f"不支持的运算符: {op_type.__name__}")
         left = _safe_eval(node.left)
         right = _safe_eval(node.right)
-        # 防止超大幂运算
+        # 防止超大幂运算（计算量指数级增长）
         if op_type == ast.Pow and right > 1000:
             raise ValueError("幂运算指数不能超过 1000")
         return SAFE_OPERATORS[op_type](left, right)
 
-    # 一元运算节点（如 -5, +3）
+    # ---- 一元运算节点（如 -5, +3） ----
     if isinstance(node, ast.UnaryOp):
         op_type = type(node.op)
         if op_type not in SAFE_OPERATORS:
@@ -91,7 +116,7 @@ def _safe_eval(node: ast.AST) -> float:
         operand = _safe_eval(node.operand)
         return SAFE_OPERATORS[op_type](operand)
 
-    # 函数调用节点（如 sqrt(9), abs(-5)）
+    # ---- 函数调用节点（如 sqrt(9), abs(-5)） ----
     if isinstance(node, ast.Call):
         if not isinstance(node.func, ast.Name):
             raise ValueError("不支持的函数调用形式")
@@ -102,9 +127,9 @@ def _safe_eval(node: ast.AST) -> float:
         func = SAFE_FUNCTIONS[func_name]
         if callable(func):
             return func(*args)
-        return func  # 常量如 pi, e
+        return func  # 常量如 pi, e（直接返回值）
 
-    # 名称节点（如 pi, e 等数学常量）
+    # ---- 名称节点（如 pi, e 等数学常量） ----
     if isinstance(node, ast.Name):
         if node.id in SAFE_FUNCTIONS:
             val = SAFE_FUNCTIONS[node.id]
@@ -112,7 +137,7 @@ def _safe_eval(node: ast.AST) -> float:
                 return val
         raise ValueError(f"不支持的变量名: {node.id}")
 
-    # Expression 包装节点
+    # ---- Expression 包装节点（AST 根节点） ----
     if isinstance(node, ast.Expression):
         return _safe_eval(node.body)
 
@@ -121,19 +146,39 @@ def _safe_eval(node: ast.AST) -> float:
 
 class CalculatorTool(BaseTool):
     """
-    数学计算器工具
+    数学计算器工具。
 
     接受一个数学表达式字符串，使用 AST 安全解析计算结果。
     支持: +, -, *, /, //, %, **, sqrt, sin, cos, tan, log, abs, round, min, max, pi, e
 
-    使用示例：
-        expression: "2 ** 10 + sqrt(144)"
-        返回: "计算结果: 1036.0"
+    这是一个纯函数工具：相同的输入永远产生相同的输出。
+    因此启用了缓存（TTL=300s），避免重复计算相同表达式。
     """
 
     @property
     def name(self) -> str:
         return "calculator"
+
+    @property
+    def timeout(self) -> float:
+        # 纯计算任务，5 秒足够
+        return 5.0
+
+    @property
+    def cache_ttl(self) -> float:
+        """纯函数，缓存 5 分钟。"""
+        return 300.0
+
+    @property
+    def quota_limit(self) -> int:
+        """
+        计算器工具的单会话配额上限（token 数）。
+
+        计算结果通常很短（几十个字符），所以配额设得较小。
+        500 tokens 约等于 750 字符，可覆盖数百次简单计算。
+        修改为 0 可取消限额，仅统计使用量。
+        """
+        return 500
 
     @property
     def description(self) -> str:
@@ -159,13 +204,12 @@ class CalculatorTool(BaseTool):
 
     def execute(self, expression: str) -> ToolResult:
         """
-        执行数学表达式计算
+        执行数学表达式计算。
 
         执行流程：
-        1. 接收表达式字符串
-        2. 使用 ast.parse() 解析为 AST
-        3. 递归遍历 AST 进行安全计算
-        4. 返回结果或错误信息
+        1. 使用 ast.parse() 解析为 AST（mode='eval' 限制为单一表达式）
+        2. 递归遍历 AST 进行安全计算
+        3. 返回结果或错误信息
 
         Args:
             expression: 数学表达式字符串
@@ -174,11 +218,11 @@ class CalculatorTool(BaseTool):
             ToolResult: 包含计算结果或错误信息
         """
         try:
-            # 使用 ast.parse 解析表达式（mode='eval' 限制为单表达式）
+            # mode='eval' 限制为单一表达式，防止执行语句
             tree = ast.parse(expression.strip(), mode="eval")
             result = _safe_eval(tree)
 
-            # 如果结果是整数，去掉小数部分
+            # 如果结果是整数，去掉小数部分（如 4.0 → 4）
             if result == int(result) and abs(result) < 1e15:
                 result = int(result)
 

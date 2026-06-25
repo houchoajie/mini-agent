@@ -1,8 +1,30 @@
 """
-Search 工具 - Mock 搜索引擎
+============================================================
+Search 工具 — Mock（模拟）搜索引擎
+============================================================
 
-模拟搜索引擎功能，返回预定义的搜索结果。
-用于演示 Agent 的工具调用能力，无需真实网络请求。
+当前实现：返回预定义的 Mock 搜索结果，无需真实网络请求。
+
+为什么用 Mock：
+    1. 减少依赖：真实搜索需要 API Key、网络请求处理、结果解析
+    2. 演示目的：Mock 数据足够展示 Agent 的"搜索-分析"能力
+    3. 可预测性：测试时结果可控，不依赖外部服务
+    4. 零成本：不需要支付搜索 API 费用
+
+Mock 数据库覆盖的主题：
+    - Python（官方文档、教程）
+    - AI Agent（概念介绍、ReAct 论文）
+    - 天气（北京、上海）
+    - 大模型（LLM 概述）
+    - Function Calling（OpenAI 指南）
+
+搜索逻辑：
+    1. 将查询转为小写
+    2. 双向匹配：查询包含关键词 或 关键词包含在查询中
+    3. 收集所有匹配结果，限制最大返回条数
+    4. 格式化输出
+
+TODO: 后续可替换为真实搜索引擎（如 DuckDuckGo、SerpAPI、Bing Search）
 """
 
 import time
@@ -11,8 +33,8 @@ from agent.tools.base import BaseTool, ToolResult
 
 # ============================================================
 # Mock 搜索数据库
-# 模拟搜索引擎索引，键为关键词，值为搜索结果列表
-# 每个结果包含: title, snippet, url
+# 键为关键词，值为搜索结果列表
+# 每条结果包含 title, snippet(摘要), url(链接)
 # ============================================================
 MOCK_SEARCH_DB: dict[str, list[dict[str, str]]] = {
     "python": [
@@ -67,7 +89,7 @@ MOCK_SEARCH_DB: dict[str, list[dict[str, str]]] = {
     ],
 }
 
-# 默认结果 - 当关键词未命中时使用
+# 默认结果 — 当关键词未命中时使用
 DEFAULT_RESULT = [
     {
         "title": "搜索结果",
@@ -79,19 +101,29 @@ DEFAULT_RESULT = [
 
 class SearchTool(BaseTool):
     """
-    Mock 搜索引擎工具
+    Mock 搜索引擎工具。
 
     模拟搜索引擎行为，根据关键词返回预定义的搜索结果。
     支持部分匹配：查询中包含数据库中的关键词即可命中。
-
-    使用示例：
-        query: "Python 教程"
-        返回: 包含 Python 相关搜索结果的格式化文本
     """
 
     @property
     def name(self) -> str:
         return "search"
+
+    @property
+    def timeout(self) -> float:
+        return 5.0
+
+    @property
+    def quota_limit(self) -> int:
+        """
+        搜索工具的单会话配额上限（token 数）。
+
+        搜索结果通常有数百字符，将配额设为 2000 tokens。
+        修改为 0 可取消限额，仅统计使用量。
+        """
+        return 2000
 
     @property
     def description(self) -> str:
@@ -120,7 +152,7 @@ class SearchTool(BaseTool):
 
     def execute(self, query: str, max_results: int = 3) -> ToolResult:
         """
-        执行 Mock 搜索
+        执行 Mock 搜索。
 
         搜索逻辑：
         1. 将查询转为小写
@@ -139,9 +171,11 @@ class SearchTool(BaseTool):
         query_lower = query.lower().strip()
         results: list[dict[str, str]] = []
 
-        # 遍历 Mock 数据库进行关键词匹配
+        # 遍历 Mock 数据库进行关键词匹配（双向匹配）
         for keyword, entries in MOCK_SEARCH_DB.items():
             # 双向匹配：查询包含关键词 或 关键词包含在查询中
+            # 例如 query="Python 教程" → 匹配 keyword="python"
+            #      query="py" → 不匹配，因为 "py" 在 "python" 中但不构成完整词
             if keyword.lower() in query_lower or query_lower in keyword.lower():
                 results.extend(entries)
 
