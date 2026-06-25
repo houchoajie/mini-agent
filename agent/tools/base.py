@@ -496,8 +496,8 @@ class BaseTool(ABC):
     - cache_ttl (property): 缓存 TTL（秒），0=不缓存
 
     安全执行流程（safe_execute）：
-        参数解析 → 参数校验 → before_execute 钩子 → 缓存检查 →
-        execute() → 缓存写入 → after_execute 钩子 → 结果截断
+        参数解析 → 参数校验 → before_execute 钩子 →
+        缓存检查 → execute() → 缓存写入 → after_execute 钩子 → 结果截断
 
     为什么设计这么多钩子和属性：
     - 让子类可以精确控制工具的每个阶段行为
@@ -511,59 +511,41 @@ class BaseTool(ABC):
     _context: ToolContext | None = None
 
     # ============================================================
-    # Per-tool 配额系统
-    # 每个工具可以独立配置自己的 token 配额上限，
-    # 默认 0 = 不限额，只统计使用量。
+    # 配额系统（子类重写 quota_limit 返回 >0 才生效）
+    # 默认值 0 表示不限额，safe_execute 跳过所有检查
     # ============================================================
-    _quota_used: int = 0  # 当前会话中该工具已使用的 token 数
+    _quota_used: int = 0
 
     @property
     def quota_limit(self) -> int:
         """
-        工具的 token 配额上限。
+        工具的 token 配额上限（单会话）。
 
-        控制该工具在单次会话中最多可以消耗多少 token（结果文本的估算值）。
-        默认 0 表示不限额，仅统计使用量。
-        子类可覆盖此属性设置具体限额。
-
-        用途：
-        - 计算器等轻量工具可设较小限额（500 tokens）
-        - 文件读取等重量工具可设较大限额（5000 tokens）
-        - 修改为 0 即取消对该工具的限额
+        默认 0 = 不限额。子类重写并返回正数即可启用：
+            class MyTool(BaseTool):
+                @property
+                def quota_limit(self) -> int:
+                    return 500   # 此工具每会话最多消耗 500 tokens
         """
         return 0
 
     @property
     def quota_used(self) -> int:
-        """获取当前会话中该工具的累计 token 使用量（结果 token 估算）。"""
+        """当前会话中该工具的累计 token 消耗（估算值）。"""
         return self._quota_used
 
     def reset_quota(self):
-        """
-        重置工具的 quota 计数器。
-
-        在新会话开始时调用，清空该工具的累计使用量。
-        由 Runtime 在创建/切换会话时自动调用。
-        """
+        """重置配额计数器（新会话时由 Runtime 调用）。"""
         self._quota_used = 0
 
-    def _check_quota(self, estimated_tokens: int = 0) -> bool:
-        """
-        检查工具配额是否还有剩余。
-
-        Args:
-            estimated_tokens: 本次调用预计消耗的 token 数（默认 0）
-
-        Returns:
-            True = 配额充足，可以执行
-            False = 配额已超限，需要拒绝执行
-        """
+    def _check_quota(self, estimated: int) -> bool:
+        """配额是否还有剩余。limit=0 时始终返回 True（不限额）。"""
         if self.quota_limit <= 0:
-            return True  # 不限额
-        return (self._quota_used + estimated_tokens) <= self.quota_limit
+            return True
+        return (self._quota_used + estimated) <= self.quota_limit
 
     def _add_quota_usage(self, tokens: int):
-        """增加工具的 quota 使用量。"""
+        """累加实际消耗（线程安全由调用方保证）。"""
         if tokens > 0:
             self._quota_used += tokens
 
@@ -870,11 +852,13 @@ class BaseTool(ABC):
         2. 参数解析（JSON 字符串 → dict）
         3. 参数校验（类型/必须/枚举值）
         4. before_execute 钩子（工具级 + 全局注册表）
-        5. 缓存检查（命中则直接返回）
-        6. execute() 核心逻辑
-        7. 缓存写入
-        8. after_execute 钩子（工具级 + 全局注册表）
-        9. 结果截断（token 级别 + 字符级别双重保护）
+        5. 配额检查（仅子类重写 quota_limit > 0 时生效）
+        6. 缓存检查（命中则直接返回）
+        7. execute() 核心逻辑
+        8. 缓存写入
+        9. after_execute 钩子（工具级 + 全局注册表）
+        10. 结果截断（token 级别 + 字符级别双重保护）
+        11. 配额用量记录（与步骤 5 联动，记录实际消耗）
 
         每一层都可能中断或修改结果，
         形成"洋葱模型"的多层保护架构。
@@ -930,25 +914,26 @@ class BaseTool(ABC):
             if isinstance(global_hook_result, dict):
                 cleaned = global_hook_result
 
-            # ---- 5. 配额检查（per-tool） ----
-            # 估算本次调用可能消耗的 token 数（以最大结果 token 为参考）
-            estimated_cost = self.max_result_tokens if self.max_result_tokens > 0 else 200
-            if not self._check_quota(estimated_cost):
-                return ToolResult(
-                    success=False,
-                    result="",
-                    error=(
-                        f"[{ErrorCode.RATE_LIMITED}] 工具 '{self.name}' 的 token 配额已耗尽"
-                        f"（已用: {self._quota_used}, 限额: {self.quota_limit}）。"
-                        f"如需继续使用，请调整该工具的 quota_limit 设置或开始新会话。"
-                    ),
-                    metadata={
-                        "error_code": ErrorCode.RATE_LIMITED,
-                        "quota_used": self._quota_used,
-                        "quota_limit": self.quota_limit,
-                        "tool_name": self.name,
-                    },
-                )
+            # ---- 5. 配额检查（仅 quota_limit > 0 时生效） ----
+            if self.quota_limit > 0:
+                # 执行前预估：只有工具重写了 max_result_tokens 才有意义
+                estimated = self.max_result_tokens if self.max_result_tokens > 0 else 0
+                if not self._check_quota(estimated):
+                    return ToolResult(
+                        success=False,
+                        result="",
+                        error=(
+                            f"[{ErrorCode.RATE_LIMITED}] 工具 '{self.name}' 的 token 配额已耗尽"
+                            f"（已用: {self._quota_used}, 限额: {self.quota_limit}）。"
+                            f"如需继续使用，请调整该工具的 quota_limit 设置或开始新会话。"
+                        ),
+                        metadata={
+                            "error_code": ErrorCode.RATE_LIMITED,
+                            "quota_used": self._quota_used,
+                            "quota_limit": self.quota_limit,
+                            "tool_name": self.name,
+                        },
+                    )
 
             # ---- 6. 缓存检查 ----
             cache = self._get_cache()
@@ -958,14 +943,14 @@ class BaseTool(ABC):
                     cached.metadata["cached"] = True
                     return cached
 
-            # ---- 7. 执行核心逻辑 ----
+            # ---- 6. 执行核心逻辑 ----
             result = self.execute(**cleaned)
 
-            # ---- 8. 缓存写入 ----
+            # ---- 7. 缓存写入 ----
             if cache and result.success:
                 cache.set(cleaned, result)
 
-            # ---- 9. after_execute 钩子（工具级） ----
+            # ---- 8. after_execute 钩子（工具级） ----
             try:
                 after_result = self.after_execute(result, ctx)
                 if isinstance(after_result, ToolResult):
@@ -973,7 +958,7 @@ class BaseTool(ABC):
             except ToolError as e:
                 return e.to_tool_result()
 
-            # ---- 10. after_execute 钩子（全局注册表） ----
+            # ---- 9. after_execute 钩子（全局注册表） ----
             try:
                 global_after = HOOKS.run_after(self.name, ctx, result)
                 if isinstance(global_after, ToolResult):
@@ -981,7 +966,7 @@ class BaseTool(ABC):
             except ToolError as e:
                 return e.to_tool_result()
 
-            # ---- 11. 结果截断保护 ----
+            # ---- 10. 结果截断保护 ----
             # 双重截断：token 级别（精确控制上下文占用）+ 字符级别（绝对上限）
             if result.success:
                 # Token 级别截断（估算值）
@@ -1026,13 +1011,13 @@ class BaseTool(ABC):
                         )
                     result.metadata["truncated"] = True
 
-            # ---- 11. 配额使用量统计 ----
-            # 对成功执行的结果，估算其 token 消耗并计入工具的 quota
+            # ---- 11. 配额用量记录（无论是否设限额，始终记录，方便排查） ----
             if result.success:
-                result_tokens = config.get_estimated_tokens(result.result)
-                self._add_quota_usage(result_tokens)
+                used = config.get_estimated_tokens(result.result)
+                self._add_quota_usage(used)
                 result.metadata["quota_used"] = self._quota_used
-                result.metadata["quota_limit"] = self.quota_limit
+                if self.quota_limit > 0:
+                    result.metadata["quota_limit"] = self.quota_limit
 
             return result
 

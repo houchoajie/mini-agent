@@ -784,12 +784,15 @@ class AgentRuntime:
             tool_quota_map = {t.name: t for t in ALL_TOOLS}
             for name, stats in sorted(tool_stats.items()):
                 avg_ms = stats["total_ms"] / stats["calls"] if stats["calls"] > 0 else 0
-                # 附加配额信息（如果该工具设置了配额限制）
+                # 附加用量信息（始终显示，有配额时显示比例）
                 quota_info = ""
                 t = tool_quota_map.get(name)
-                if t and t.quota_limit > 0:
-                    pct = min(100.0, round(t.quota_used / t.quota_limit * 100, 1))
-                    quota_info = f" | 配额: {t.quota_used}/{t.quota_limit} ({pct}%)"
+                if t and t.quota_used > 0:
+                    if t.quota_limit > 0:
+                        pct = min(100.0, round(t.quota_used / t.quota_limit * 100, 1))
+                        quota_info = f" | 用量: {t.quota_used}/{t.quota_limit} ({pct}%)"
+                    else:
+                        quota_info = f" | 用量: {t.quota_used}（无限额）"
                 lines.append(
                     f"  {name}: {stats['calls']} 次调用, "
                     f"{stats['success']} 成功/{stats['fail']} 失败, "
