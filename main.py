@@ -37,6 +37,7 @@ Mini Agent — CLI 主入口
 
 import sys
 import os
+import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -112,32 +113,23 @@ def login_loop(user_manager: UserManager) -> str:
             print("❌ 无效选择，请输入 1、2 或 3")
 
 
-def main():
+async def main():
     """
-    主函数 — 交互式 CLI 循环。
+    主协程 — 交互式 CLI 循环（异步版本）。
 
-    完整执行流程：
-    1. 用户登录/注册（UserManager 验证凭证）
-    2. 解析命令行参数（--session, --list）
-    3. API Key 检查（未配置则退出）
-    4. 打印启动横幅
-    5. 初始化 AgentRuntime（自动创建/恢复会话，TraceLogger 使用正确 session_id）
-    6. 进入交互式 while 循环：
-       a. 读取用户输入
-       b. 检查是否为内置命令（/开头）
-          └── 命令 → 执行对应操作（/new, /switch, /quit 等）
-          └── 对话 → 调用 runtime.run_stream() 流式输出
-       c. 异常捕获 → 友好错误提示，继续运行（不崩溃）
+    完整执行流程与同步版本相同，但使用 asyncio 实现：
+    - 用户输入通过 asyncio.to_thread 运行（不阻塞事件循环）
+    - Agent Runtime 使用异步流式 API（非阻塞流式输出）
+    - 工具并行执行使用 asyncio 原生并发（替代 ThreadPoolExecutor）
+    - 会话保存使用异步锁（asyncio.Lock）
 
-    运行时数据文件：
-        .agent_data/<username>/session/  — 会话 JSON 文件
-        .agent_data/<username>/log/      — Trace 日志文件
-        .agent_data/<username>/task/     — 任务数据文件
-
-    注意：
-        - TraceLogger 由 Runtime 内部创建（不再由 main.py 提前创建）
-        - 保证日志文件的 session_id 与实际会话 ID 一致
-        - 每次用户输入和工具结果都会立即持久化（_save()）
+    内置命令（与同步版本相同）：
+        /new          — 新建会话（自动保存当前会话）
+        /switch ID   — 切换到指定会话
+        /sessions    — 列出当前用户的所有会话
+        /trace       — 查看执行追踪摘要（含 token 统计）
+        /clear       — 清空当前对话历史（保留 system prompt）
+        /quit        — 退出程序（自动保存当前会话）
     """
     # === 用户管理 ===
     user_manager = UserManager()
@@ -193,15 +185,16 @@ def main():
     print()
 
     # ============================================================
-    # 交互式对话循环
+    # 交互式对话循环（异步）
     # ============================================================
     # 使用当前用户的 session_manager
     session_manager = SessionManager(user_dir=user_manager.get_user_dir(username))
 
     while True:
         try:
-            # 读取用户输入
-            user_input = input("You: ").strip()
+            # 读取用户输入（在线程中执行，不阻塞事件循环）
+            user_input = await asyncio.to_thread(input, "You: ")
+            user_input = user_input.strip()
 
             if not user_input:
                 continue
@@ -215,13 +208,13 @@ def main():
                 arg = cmd_parts[1] if len(cmd_parts) > 1 else ""
 
                 if cmd == "/quit" or cmd == "/exit":
-                    runtime.save_session()
+                    await runtime.save_session()
                     print("👋 再见！")
                     break
 
                 elif cmd == "/new":
                     # 保存当前会话再新建（TraceLogger 由 Runtime 自动创建）
-                    runtime.save_session()
+                    await runtime.save_session()
                     runtime = AgentRuntime(max_steps=10, username=username)
                     print(f"✅ 新会话已创建: {runtime.session_id}")
                     continue
@@ -230,7 +223,7 @@ def main():
                     if not arg:
                         print("用法: /switch <session_id>")
                         continue
-                    runtime.save_session()
+                    await runtime.save_session()
                     result = runtime.switch_session(arg)
                     print(f"{'✅' if '已切换' in result else '❌'} {result}")
                     continue
@@ -252,7 +245,7 @@ def main():
 
                 elif cmd == "/clear":
                     runtime.session.clear_history()
-                    runtime.save_session()
+                    await runtime.save_session()
                     print("✅ 对话历史已清空")
                     continue
 
@@ -261,12 +254,12 @@ def main():
                     continue
 
             # ============================================================
-            # 正常对话 - 流式调用 Agent Runtime
+            # 正常对话 - 异步流式调用 Agent Runtime
             # ============================================================
             print()
             print("Agent: ", end="", flush=True)
             ask_question = None  # 多轮交互：工具向用户提问
-            for event in runtime.run_stream(user_input):
+            async for event in runtime.run_stream(user_input):
                 if event["type"] == "text_chunk":
                     print(event["data"], end="", flush=True)
                 elif event["type"] == "ask_user":
@@ -281,7 +274,7 @@ def main():
             print()
 
         except KeyboardInterrupt:
-            runtime.save_session()
+            await runtime.save_session()
             print("\n\n👋 收到中断信号，再见！")
             break
         except Exception as e:
@@ -290,4 +283,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

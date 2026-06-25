@@ -31,7 +31,8 @@ LLM 客户端 — 封装 OpenAI（及兼容 API）的 Chat Completions 调用
 import os
 import json
 import time
-from openai import OpenAI
+import asyncio
+from openai import OpenAI, AsyncOpenAI
 from agent.trace import TraceLogger
 from agent import config
 
@@ -86,10 +87,16 @@ class LLMClient:
         self.trace = trace or TraceLogger()
         self.timeout = timeout or float(os.getenv("LLM_TIMEOUT", "60"))
 
-        # 初始化 OpenAI SDK 客户端
+        # 初始化 OpenAI SDK 客户端（同步 + 异步）
         # max_retries=0：关闭 SDK 内置重试，使用自定义重试逻辑
         # 为什么：SDK 的重试策略不可定制，自实现可以控制退避策略和日志
         self.client = OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=self.timeout,
+            max_retries=0,
+        )
+        self.async_client = AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
             timeout=self.timeout,
@@ -231,30 +238,20 @@ class LLMClient:
 
         raise last_exception
 
-    def chat_stream_detect_tools(
+    async def chat_stream_detect_tools_async(
         self,
         messages: list[dict],
         tools: list[dict] | None = None,
         max_retries: int = 3,
     ):
         """
-        流式聊天 + 工具调用检测（最关键的方法）。
+        （异步版本）流式聊天 + 工具调用检测。
 
-        边流式输出文本内容，边从流中检测工具调用请求。
-        用于 run_stream() 场景，实现"边输出边判断工具调用"的流式体验。
-
-        为什么需要一个单独的方法而非复用 chat_stream：
-        - 流式 API 的 tool_calls 是增量到达的（每个 chunk 带一部分）
-        - 需要累加器将所有碎片拼成完整的 tool_calls
-        - 纯文本流和工具调用流的处理逻辑不同
-
-        Yields:
-            dict:
-                {"type": "content", "data": str}       — 文本片段
-                {"type": "tool_calls_done", "data": []} — 流结束，检测到工具调用
+        与 chat_stream_detect_tools 功能完全相同，但使用 AsyncOpenAI 客户端，
+        支持在 asyncio 事件循环中非阻塞执行。
 
         使用示例：
-            for event in llm.chat_stream_detect_tools(messages, tools):
+            async for event in llm.chat_stream_detect_tools_async(messages, tools):
                 if event["type"] == "content":
                     print(event["data"], end="")
                 elif event["type"] == "tool_calls_done":
@@ -262,26 +259,17 @@ class LLMClient:
         """
         self.trace.log_llm_request(messages, tools)
 
-        max_tokens = None  # 不限制，见 chat() 中的说明
-
         kwargs: dict = {
             "model": self.model,
             "messages": messages,
             "temperature": 0.7,
             "stream": True,
         }
-        if max_tokens is not None:
-            kwargs["max_tokens"] = max_tokens
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
 
-        # ============================================================
-        # 工具调用累加器
-        # ============================================================
-        # 因为流式 API 的 tool_calls 是增量到达的，每个 chunk 携带一部分
-        # 用 index 做 key 区分多个并行工具调用
-        # 例如 LLM 同时调用 search+calculator，累加器分别收集两者的参数
+        # 工具调用累加器（流式 API 的 tool_calls 是增量到达的）
         tool_calls_acc: dict[int, dict] = {}
 
         last_exception = None
@@ -289,8 +277,8 @@ class LLMClient:
             tool_calls_acc.clear()
             _content_chunks: list[str] = []
             try:
-                stream = self.client.chat.completions.create(**kwargs)
-                for chunk in stream:
+                stream = await self.async_client.chat.completions.create(**kwargs)
+                async for chunk in stream:
                     if not chunk.choices:
                         continue
                     delta = chunk.choices[0].delta
@@ -301,8 +289,6 @@ class LLMClient:
                         yield {"type": "content", "data": delta.content}
 
                     # ---- 工具调用（流式增量）：累加拼接 ----
-                    # 每次 chunk 只携带 tool_calls 的一小部分
-                    # 例如第一个 chunk 有 id 和 name，后续 chunk 有 arguments 片段
                     if delta.tool_calls:
                         for tc_delta in delta.tool_calls:
                             idx = tc_delta.index
@@ -322,9 +308,7 @@ class LLMClient:
 
                 # ---- 流正常结束 ----
                 if tool_calls_acc:
-                    # 有工具调用：按 index 排序后返回
                     tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc.keys())]
-                    # 流式 API 不返回 usage 信息，用估算
                     prompt_text = str(messages)
                     completion_text = json.dumps(tool_calls)
                     self.last_usage = {
@@ -338,7 +322,6 @@ class LLMClient:
                     })
                     yield {"type": "tool_calls_done", "data": tool_calls}
                 else:
-                    # 纯文本回复，无工具调用
                     collected = "".join(_content_chunks)
                     self.last_usage = {
                         "prompt_tokens": config.get_estimated_tokens(str(messages)),
@@ -357,13 +340,13 @@ class LLMClient:
                 if attempt < max_retries - 1:
                     wait_time = 2 ** attempt
                     self.trace.log_error(
-                        f"LLM 流式调用失败 (第 {attempt + 1}/{max_retries} 次), "
+                        f"LLM 异步流式调用失败 (第 {attempt + 1}/{max_retries} 次), "
                         f"{wait_time}s 后重试: {type(e).__name__}: {e}"
                     )
-                    time.sleep(wait_time)
+                    await asyncio.sleep(wait_time)
                 else:
                     self.trace.log_error(
-                        f"LLM 流式调用最终失败 (已重试 {max_retries} 次): "
+                        f"LLM 异步流式调用最终失败 (已重试 {max_retries} 次): "
                         f"{type(e).__name__}: {e}"
                     )
 

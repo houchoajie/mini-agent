@@ -595,7 +595,7 @@ class BaseTool(ABC):
         属性越多（description 越详细），LLM 生成的参数越准确。
         """
         ...
-
+    # 只有很简单、没有外部依赖的工具才可以直接调用它
     @abstractmethod
     def execute(self, **kwargs) -> ToolResult:
         """
@@ -1055,6 +1055,197 @@ class BaseTool(ABC):
             )
             return tool_error.to_tool_result()
 
+    async def safe_execute_async(self, arguments: str | dict,
+                                  context: ToolContext | None = None) -> ToolResult:
+        """
+        异步安全执行工具 — 完整的执行流水线（异步版本）。
+
+        与 safe_execute 功能完全相同，但在核心执行阶段使用 execute_async，
+        适合在 asyncio 事件循环中调用。
+
+        对于重写了 execute_async 的工具（如网络请求、大文件操作），
+        使用此方法可获得更好的并发性能。
+        对于仅有 execute 的工具，会自动在线程池中执行。
+
+        执行流程同 safe_execute：
+        1. 设置上下文 → 2. 参数解析 → 3. 参数校验 →
+        4. before_execute 钩子 → 5. 配额检查 → 6. 缓存检查 →
+        7. execute_async() → 8. 缓存写入 → 9. after_execute 钩子 →
+        10. 结果截断 → 11. 配额记录
+        """
+        # 设置上下文
+        if context is not None:
+            self._context = context
+        ctx = self.get_context()
+
+        try:
+            # ---- 1. 参数解析 ----
+            if isinstance(arguments, str):
+                args_dict = json.loads(arguments) if arguments.strip() else {}
+            else:
+                args_dict = arguments
+
+            # ---- 2. 参数校验 ----
+            cleaned, errors = self._validate_params(self.parameters, args_dict)
+            if errors:
+                return ToolResult(
+                    success=False,
+                    result="",
+                    error=f"[{ErrorCode.INVALID_PARAMS}] 参数校验失败:\n" + "\n".join(f"  - {e}" for e in errors),
+                    metadata={"error_code": ErrorCode.INVALID_PARAMS, "validation_errors": errors},
+                )
+
+            # ---- 3. before_execute 钩子（工具级） ----
+            try:
+                hook_result = self.before_execute(cleaned, ctx)
+            except ToolError as e:
+                return e.to_tool_result()
+            if isinstance(hook_result, ToolResult):
+                return hook_result
+            if isinstance(hook_result, dict):
+                cleaned = hook_result
+
+            # ---- 4. before_execute 钩子（全局注册表） ----
+            try:
+                global_hook_result = HOOKS.run_before(self.name, ctx, cleaned)
+            except ToolError as e:
+                return e.to_tool_result()
+            if isinstance(global_hook_result, ToolResult):
+                return global_hook_result
+            if isinstance(global_hook_result, dict):
+                cleaned = global_hook_result
+
+            # ---- 5. 配额检查 ----
+            if self.quota_limit > 0:
+                estimated = self.max_result_tokens if self.max_result_tokens > 0 else 0
+                if not self._check_quota(estimated):
+                    return ToolResult(
+                        success=False,
+                        result="",
+                        error=(
+                            f"[{ErrorCode.RATE_LIMITED}] 工具 '{self.name}' 的 token 配额已耗尽"
+                            f"（已用: {self._quota_used}, 限额: {self.quota_limit}）。"
+                            f"如需继续使用，请调整该工具的 quota_limit 设置或开始新会话。"
+                        ),
+                        metadata={
+                            "error_code": ErrorCode.RATE_LIMITED,
+                            "quota_used": self._quota_used,
+                            "quota_limit": self.quota_limit,
+                            "tool_name": self.name,
+                        },
+                    )
+
+            # ---- 6. 缓存检查 ----
+            cache = self._get_cache()
+            if cache:
+                cached = cache.get(cleaned)
+                if cached is not None:
+                    cached.metadata["cached"] = True
+                    return cached
+
+            # ---- 7. 执行核心逻辑（异步） ----
+            result = await self.execute_async(**cleaned)
+
+            # ---- 8. 缓存写入 ----
+            if cache and result.success:
+                cache.set(cleaned, result)
+
+            # ---- 9. after_execute 钩子（工具级） ----
+            try:
+                after_result = self.after_execute(result, ctx)
+                if isinstance(after_result, ToolResult):
+                    result = after_result
+            except ToolError as e:
+                return e.to_tool_result()
+
+            # ---- 10. after_execute 钩子（全局注册表） ----
+            try:
+                global_after = HOOKS.run_after(self.name, ctx, result)
+                if isinstance(global_after, ToolResult):
+                    result = global_after
+            except ToolError as e:
+                return e.to_tool_result()
+
+            # ---- 11. 结果截断保护 ----
+            if result.success:
+                if self.max_result_tokens > 0:
+                    warn = config.is_token_truncate_warn_enabled()
+                    truncated = config.truncate_by_tokens(
+                        result.result, self.max_result_tokens, warn=warn
+                    )
+                    if truncated != result.result:
+                        result.result = truncated
+                        result.metadata["truncated"] = True
+
+                if self.max_result_chars > 0 and len(result.result) > self.max_result_chars:
+                    truncated = result.result[:self.max_result_chars]
+                    last_newline = truncated.rfind("\n")
+                    if last_newline > 0:
+                        truncated = truncated[:last_newline]
+                    elif last_newline == 0:
+                        truncated = ""
+
+                    total_lines = result.result.count("\n") + 1
+                    shown_lines = truncated.count("\n") + 1 if truncated else 0
+
+                    if result.continuation:
+                        hint = result.continuation.get("hint", "")
+                        result.result = truncated + (
+                            f"\n\n[...结果过长，已截断为前 {self.max_result_chars} 字符，"
+                            f"当前显示 {shown_lines}/{total_lines} 行。\n"
+                            f"{hint}]"
+                        )
+                    else:
+                        result.result = truncated + (
+                            f"\n\n[...结果过长，已截断为前 {self.max_result_chars} 字符，"
+                            f"当前显示 {shown_lines}/{total_lines} 行，"
+                            f"完整结果共 {len(result.result)} 字符。\n"
+                            f"该工具不支持分页读取，被截断的部分无法继续获取。]"
+                        )
+                    result.metadata["truncated"] = True
+
+            # ---- 12. 配额用量记录 ----
+            if result.success:
+                used = config.get_estimated_tokens(result.result)
+                self._add_quota_usage(used)
+                result.metadata["quota_used"] = self._quota_used
+                if self.quota_limit > 0:
+                    result.metadata["quota_limit"] = self.quota_limit
+
+            return result
+
+        except json.JSONDecodeError as e:
+            return ToolResult(
+                success=False,
+                result="",
+                error=f"[{ErrorCode.INVALID_PARAMS}] 参数解析失败: {e}",
+                metadata={"error_code": ErrorCode.INVALID_PARAMS},
+            )
+        except TypeError as e:
+            return ToolResult(
+                success=False,
+                result="",
+                error=f"[{ErrorCode.INVALID_PARAM_TYPE}] 参数类型错误: {e}",
+                metadata={"error_code": ErrorCode.INVALID_PARAM_TYPE},
+            )
+        except ToolError as e:
+            try:
+                on_error_result = self.on_error(e, ctx)
+                if isinstance(on_error_result, ToolResult):
+                    return on_error_result
+                global_error = HOOKS.run_on_error(self.name, ctx, e)
+                if isinstance(global_error, ToolResult):
+                    return global_error
+            except Exception:
+                pass
+            return e.to_tool_result()
+        except Exception as e:
+            tool_error = ToolError(
+                ErrorCode.EXECUTION_ERROR,
+                f"{type(e).__name__}: {e}",
+            )
+            return tool_error.to_tool_result()
+
     def clear_cache(self):
         """手动清空工具缓存。"""
         if self._cache_instance:
@@ -1094,6 +1285,7 @@ class BaseTool(ABC):
                 errors.append(f"缺少必须参数 '{name}'")
 
         # 清洗可选参数
+        # 遍历 schema 定义的参数，如果模型没有传，有默认用默认
         for name, prop in props.items():
             if name not in raw_args or raw_args[name] is None:
                 if "default" in prop:
@@ -1108,7 +1300,7 @@ class BaseTool(ABC):
             if not ok:
                 continue
 
-            # enum 值校验
+            # enum 值校验  如果枚举了白名单，查看模型输入的值在不在合法枚举之内
             if prop_enum is not None and converted not in prop_enum:
                 errors.append(
                     f"参数 '{name}' 的值 '{converted}' 不在允许范围内: {prop_enum}"

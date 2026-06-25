@@ -113,17 +113,15 @@ async def execute_async(
 
         try:
             if _is_async_override(tool):
-                # 使用原生异步执行（工具自身提供了协程实现）
+                # 工具重写了 execute_async → 使用完整的异步安全执行流水线
+                # safe_execute_async 包含：参数校验、钩子、配额、缓存、截断等
                 result = await asyncio.wait_for(
-                    tool.execute_async(
-                        **(arguments if isinstance(arguments, dict)
-                           else _parse_args(arguments))
-                    ),
+                    tool.safe_execute_async(arguments, context),
                     timeout=effective_timeout,
                 )
             else:
-                # 使用线程池执行同步方法
-                # 将同步工具包装为协程，统一返回类型
+                # 工具仅有同步 execute → 在线程池中执行 safe_execute
+                # safe_execute 包含：参数校验、钩子、配额、缓存、执行、截断
                 result = await asyncio.get_event_loop().run_in_executor(
                     _EXECUTOR,
                     tool.safe_execute,
@@ -179,79 +177,6 @@ async def execute_async(
         error="[EXECUTION_ERROR] 工具执行失败（所有尝试已耗尽）",
         metadata={"error_code": "EXECUTION_ERROR"},
     )
-
-
-def execute_sync(
-    tool: BaseTool,
-    arguments: str | dict,
-    timeout: float | None = None,
-    context: ToolContext | None = None,
-) -> ToolResult:
-    """
-    同步执行工具（兼容现有代码的调用方式）。
-
-    内部通过事件循环调用 execute_async。
-    如果当前线程已有事件循环（如在 asyncio 环境中），
-    则创建新线程和新事件循环来执行，避免阻塞当前循环。
-
-    Args:
-        tool: 工具实例
-        arguments: 参数
-        timeout: 超时
-        context: 上下文
-
-    Returns:
-        ToolResult: 执行结果
-    """
-    try:
-        loop = asyncio.get_running_loop()
-        # 已有事件循环 → 创建新循环在线程中执行
-        # 为什么：如果在异步上下文中直接 run_until_complete，
-        # 会报 "Cannot run the event loop while it's running"
-        import threading
-        result_container = []
-
-        def _run():
-            new_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(new_loop)
-            try:
-                r = new_loop.run_until_complete(
-                    execute_async(tool, arguments, timeout, context)
-                )
-                result_container.append(r)
-            finally:
-                new_loop.close()
-
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
-        thread.join(timeout=(timeout or tool.timeout) + 10)
-        if result_container:
-            return result_container[0]
-        return ToolResult(
-            success=False, result="",
-            error="[TIMEOUT] 工具执行超时",
-            metadata={"error_code": "TIMEOUT"},
-        )
-
-    except RuntimeError:
-        # 没有事件循环 → 直接创建并使用
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(
-                execute_async(tool, arguments, timeout, context)
-            )
-        finally:
-            loop.close()
-
-
-def _parse_args(arguments: str) -> dict:
-    """解析 JSON 字符串为字典。解析失败返回空字典。"""
-    import json
-    try:
-        return json.loads(arguments) if arguments.strip() else {}
-    except json.JSONDecodeError:
-        return {}
 
 
 def _log_retry(tool: BaseTool, attempt: int, error: str | None, delay: float):

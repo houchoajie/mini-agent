@@ -25,8 +25,7 @@ ReAct 循环流程：
 """
 
 import json
-import threading
-import concurrent.futures
+import asyncio
 from pathlib import Path
 from agent.llm import LLMClient
 from agent.session import Session, SessionManager
@@ -34,9 +33,9 @@ from agent.trace import TraceLogger
 from agent.memory import ConversationMemory
 from agent.tools import get_tool_by_name, get_all_tool_schemas, ALL_TOOLS
 from agent.tools.base import ToolContext
-from agent.tool_executor import execute_sync
+from agent.tool_executor import execute_async
 from agent import config
-from typing import Generator
+from typing import AsyncGenerator
 
 
 class AgentRuntime:
@@ -98,7 +97,7 @@ class AgentRuntime:
         """
         self.max_steps = max_steps
         self.username = username
-        self._save_lock = threading.Lock()
+        self._save_lock = asyncio.Lock()
 
         # 获取用户目录
         user_dir = None
@@ -249,19 +248,19 @@ class AgentRuntime:
     # 所有调用场景统一使用 run_stream() 流式方法。
     # 流式 Generator 可通过收集事件拼回完整字符串，覆盖原 run() 的所有用途。
 
-    def run_stream(self, user_input: str) -> Generator[dict, None, None]:
+    async def run_stream(self, user_input: str) -> AsyncGenerator[dict, None]:
         """
-        流式处理用户输入 — 逐步 yield 事件供前端实时展示（流式模式）。
+        流式处理用户输入 — 逐步 yield 事件供前端实时展示（异步流式模式）。
 
         与 run() 的区别：
         - run() 使用非流式 chat()，所有 LLM 调用等待完整响应
-        - run_stream() 使用 chat_stream_detect_tools()，边输出文本边检测工具调用
-        - 用户可以看到 AI "打字"效果，无需等待完整响应
+        - run_stream() 使用 chat_stream_detect_tools_async()，边输出文本边检测工具调用
+        - 异步版本使用 asyncio 而非线程，避免 GIL 限制，支持并发工具执行
 
         事件类型：
             text_chunk  — LLM 文本片段（逐 token）
             tool_call   — LLM 请求调用工具
-            tool_result — 工具执行结果
+            tool_result — 工具执行结果（按完成顺序逐条输出）
             step        — 当前步数信息
             ask_user    — 工具需要向用户提问（多轮交互）
             done        — 本轮处理完成
@@ -269,8 +268,8 @@ class AgentRuntime:
 
         工作原理：
         1. 将用户输入加入历史并持久化
-        2. 检查记忆压缩
-        3. ReAct 主循环（同 run()，但全部使用流式 API）
+        2. 检查记忆压缩（同步调用 LLM 时使用 asyncio.to_thread）
+        3. ReAct 主循环（LLM 流式调用 + 异步并发工具执行）
         4. 完成后 yield done
 
         Args:
@@ -282,24 +281,28 @@ class AgentRuntime:
         # 记录用户输入
         self.trace.log_user_input(user_input)
         self.session.add_message("user", user_input)
-        self._save()  # 用户输入后立即持久化
+        await self._save()  # 用户输入后立即持久化
 
         # ============================================================
         # 对话记忆压缩检查
         # ============================================================
         if self.memory.should_compress(self.session.messages):
             self.trace.log_system("对话历史过长，正在压缩早期消息...")
-            compressed = self.memory.compress(self.session.messages, self.llm)
+            # compress 内部调用 llm.chat()（同步），在线程中执行避免阻塞事件循环
+            loop = asyncio.get_event_loop()
+            compressed = await loop.run_in_executor(
+                None, self.memory.compress, self.session.messages, self.llm
+            )
             self.session.messages = compressed
             self.trace.log_system(f"压缩完成: {len(compressed)} 条消息")
 
         # ============================================================
-        # ReAct 主循环 — 全部使用流式 API
+        # ReAct 主循环 — 全部使用异步流式 API
         # ============================================================
         step = 0
         while step < self.max_steps:
             step += 1
-            self.trace.log_step(step, self.max_steps, "调用 LLM 推理（流式）")
+            self.trace.log_step(step, self.max_steps, "调用 LLM 推理（异步流式）")
             yield {"type": "step", "data": {"step": step, "max_steps": self.max_steps}}
 
             # ============================================================
@@ -315,11 +318,11 @@ class AgentRuntime:
                     return
 
             try:
-                # 流式调用 LLM，边输出文本边检测工具调用
+                # 异步流式调用 LLM，边输出文本边检测工具调用
                 collected_content = []
                 tool_calls = None
 
-                for event in self.llm.chat_stream_detect_tools(
+                async for event in self.llm.chat_stream_detect_tools_async(
                     messages=self.session.get_messages(),
                     tools=self.tool_schemas,
                 ):
@@ -336,7 +339,7 @@ class AgentRuntime:
                 self.trace.log_error(error_msg)
                 yield {"type": "error", "data": error_msg}
                 self.session.add_message("assistant", f"抱歉，我遇到了一些问题: {e}")
-                self._save()
+                await self._save()
                 yield {"type": "done"}
                 return
 
@@ -353,75 +356,76 @@ class AgentRuntime:
                     full_content,
                     tool_calls=tool_calls,
                 )
-                self._save()  # 立即持久化，防止窗口期丢失
+                await self._save()  # 立即持久化，防止窗口期丢失
 
                 # ============================================================
-                # 多线程并行执行所有工具调用 + 流式事件输出
+                # 异步并发执行所有工具调用 + 流式事件输出
+                # 使用 asyncio.as_completed 按完成顺序输出结果
                 # ============================================================
-                with concurrent.futures.ThreadPoolExecutor(max_workers=len(tool_calls)) as executor:
-                    future_to_tc = {
-                        executor.submit(self._execute_single_tool_sync, tc, step): tc
-                        for tc in tool_calls
-                    }
-                    for future in concurrent.futures.as_completed(future_to_tc):
-                        tc = future_to_tc[future]
-                        try:
-                            data = future.result()
-                        except Exception as e:
-                            data = {
-                                "tc_id": tc.get("id", ""),
-                                "func_name": tc.get("function", {}).get("name", "?"),
-                                "func_args": tc.get("function", {}).get("arguments", "{}"),
-                                "success": False,
-                                "result_text": f"工具执行线程异常: {e}",
-                                "elapsed_ms": 0,
-                                "truncated": False,
-                                "error": str(e),
-                                "tool_not_found": False,
-                            }
+                tasks = {
+                    asyncio.create_task(
+                        self._execute_single_tool_async(tc, step)
+                    ): tc for tc in tool_calls
+                }
 
-                        # 记录 trace 日志
-                        self.trace.log_tool_call(data["func_name"], data["func_args"], step)
-                        self.trace.log_tool_result(
-                            data["func_name"], data["success"], data["result_text"], step,
-                            elapsed_ms=data["elapsed_ms"],
-                            truncated=data["truncated"],
-                        )
-
-                        # 将工具结果添加到对话历史
-                        self.session.add_message("tool", data["result_text"], tool_call_id=data["tc_id"])
-
-                        # 流式事件
-                        yield {"type": "tool_call", "data": {"tool": data["func_name"], "args": data["func_args"]}}
-                        yield {
-                            "type": "tool_result",
-                            "data": {
-                                "tool": data["func_name"],
-                                "success": data["success"],
-                                "result": data["result_text"][:300],
-                            },
+                for coro in asyncio.as_completed(tasks):
+                    tc = tasks[coro]
+                    try:
+                        data = await coro
+                    except Exception as e:
+                        data = {
+                            "tc_id": tc.get("id", ""),
+                            "func_name": tc.get("function", {}).get("name", "?"),
+                            "func_args": tc.get("function", {}).get("arguments", "{}"),
+                            "success": False,
+                            "result_text": f"工具执行异步任务异常: {e}",
+                            "elapsed_ms": 0,
+                            "truncated": False,
+                            "error": str(e),
+                            "tool_not_found": False,
                         }
 
-                        # ============================================================
-                        # 多轮交互：工具需要向用户提问
-                        # ============================================================
-                        ask_question = data.get("ask_user")
-                        if ask_question:
-                            self.trace.log_system(f"工具请求用户输入: {ask_question}")
-                            # 向用户提问，等待下一轮用户输入
-                            yield {
-                                "type": "ask_user",
-                                "data": {
-                                    "tool": data["func_name"],
-                                    "question": ask_question,
-                                },
-                            }
-                            # 此时流结束，下一轮用户输入会作为答案
-                            yield {"type": "done"}
-                            return
+                    # 记录 trace 日志
+                    self.trace.log_tool_call(data["func_name"], data["func_args"], step)
+                    self.trace.log_tool_result(
+                        data["func_name"], data["success"], data["result_text"], step,
+                        elapsed_ms=data["elapsed_ms"],
+                        truncated=data["truncated"],
+                    )
 
-                        # 每次工具结果写入后立即持久化会话
-                        self._save()
+                    # 将工具结果添加到对话历史
+                    self.session.add_message("tool", data["result_text"], tool_call_id=data["tc_id"])
+
+                    # 流式事件：先输出工具调用信息，再输出结果
+                    yield {"type": "tool_call", "data": {"tool": data["func_name"], "args": data["func_args"]}}
+                    yield {
+                        "type": "tool_result",
+                        "data": {
+                            "tool": data["func_name"],
+                            "success": data["success"],
+                            "result": data["result_text"][:300],
+                        },
+                    }
+
+                    # ============================================================
+                    # 多轮交互：工具需要向用户提问
+                    # ============================================================
+                    ask_question = data.get("ask_user")
+                    if ask_question:
+                        self.trace.log_system(f"工具请求用户输入: {ask_question}")
+                        yield {
+                            "type": "ask_user",
+                            "data": {
+                                "tool": data["func_name"],
+                                "question": ask_question,
+                            },
+                        }
+                        # 此时流结束，下一轮用户输入会作为答案
+                        yield {"type": "done"}
+                        return
+
+                    # 每次工具结果写入后立即持久化会话
+                    await self._save()
 
                 # 继续循环，让 LLM 根据工具结果继续推理
                 continue
@@ -430,13 +434,13 @@ class AgentRuntime:
                 # ---- 没有工具调用，已通过流式输出完成回复 ----
                 full_content = "".join(collected_content)
 
-                self.trace.log_step(step, self.max_steps, "LLM 给出最终回复（流式）")
+                self.trace.log_step(step, self.max_steps, "LLM 给出最终回复（异步流式）")
 
                 # 将完整回复添加到历史
                 self.session.add_message("assistant", full_content)
 
                 # 保存会话
-                self._save()
+                await self._save()
                 yield {"type": "done"}
                 return
 
@@ -452,7 +456,7 @@ class AgentRuntime:
             "你已经执行了很多步骤，请直接给出你的最终结论或总结。",
         )
         try:
-            for event in self.llm.chat_stream_detect_tools(
+            async for event in self.llm.chat_stream_detect_tools_async(
                 messages=self.session.get_messages(),
                 tools=None,  # 不再传递工具，强制文本回复
             ):
@@ -463,7 +467,7 @@ class AgentRuntime:
             final = "抱歉，执行步骤过多，无法继续处理。请简化问题后重试。"
             yield {"type": "text_chunk", "data": final}
 
-        self._save()
+        await self._save()
         yield {"type": "done"}
 
     def _build_context(self) -> ToolContext:
@@ -493,46 +497,17 @@ class AgentRuntime:
             runtime_ref=self,
         )
 
-    def _execute_tool_call(self, tc: dict, step: int,
-                           stream_mode: bool = False) -> Generator[dict, None, None] | None:
+    async def _execute_single_tool_async(self, tc: dict, step: int) -> dict:
         """
-        统一工具执行方法 — 事件包装层
+        执行单个工具调用（异步版本）
 
-        内部调用线程安全的 _execute_single_tool_sync() 执行工具，
-        再根据需要 yield 流式事件。保留与 run() 的兼容。
-
-        Args:
-            tc: LLM 返回的 tool_call 字典
-            step: 当前 ReAct 步数
-            stream_mode: 为 True 时 yield 事件供前端展示
-
-        Yields:
-            stream_mode=True 时，逐个 yield 事件字典
-        """
-        data = self._execute_single_tool_sync(tc, step)
-
-        if stream_mode:
-            if data.get("error"):
-                yield {"type": "error", "data": data["result_text"]}
-            else:
-                yield {"type": "tool_call", "data": {"tool": data["func_name"], "args": data["func_args"]}}
-                yield {
-                    "type": "tool_result",
-                    "data": {
-                        "tool": data["func_name"],
-                        "success": data["success"],
-                        "result": data["result_text"][:300],
-                    },
-                }
-
-    def _execute_single_tool_sync(self, tc: dict, step: int) -> dict:
-        """
-        执行单个工具调用（线程安全）
-
-        将解析、查找、执行集中到一个同步方法中，返回结果字典。
+        将解析、查找、执行集中到一个异步方法中，返回结果字典。
         构建 ToolContext 并传递给工具，支持鉴权和上下文感知。
-        不访问 self.session，可安全地在多线程中执行。
-        日志记录由调用方统一处理。
+        内部使用 tool_executor.execute_async 进行实际执行，支持：
+        - 超时控制
+        - 自动重试
+        - 异步执行（工具重写了 execute_async 时）
+        - 同步回退（工具仅有 execute 时在线程池中执行）
 
         Args:
             tc: LLM 返回的 tool_call 字典
@@ -547,8 +522,8 @@ class AgentRuntime:
                 "result_text": str,
                 "elapsed_ms": float,
                 "truncated": bool,
-                "error": str | None,       # 解析错误时非 None
-                "tool_not_found": bool,     # 工具不存在标记
+                "error": str | None,
+                "tool_not_found": bool,
             }
         """
         # ================================================================
@@ -597,17 +572,15 @@ class AgentRuntime:
                 "tool_not_found": True,
             }
 
-        # 构建上下文并执行
+        # 构建上下文并异步执行
         context = self._build_context()
-        result = execute_sync(tool, func_args, context=context)
+        result = await execute_async(tool, func_args, context=context)
 
         # ================================================================
         # 工具执行后：更新会话级 token 累计用量
-        # 不仅包含 LLM API 返回的 token，也包含工具结果的估算 token
         # ================================================================
         if result.success:
             tool_result_tokens = config.get_estimated_tokens(result.result)
-            # 将工具结果 token 累加到会话总量中（供会话级限额检查）
             if tool_result_tokens > 0:
                 self._total_tokens_used += tool_result_tokens
                 self.session.add_token_usage(
@@ -627,81 +600,24 @@ class AgentRuntime:
             "truncated": result.metadata.get("truncated", False),
             "error": None,
             "tool_not_found": False,
-            "ask_user": result.ask_user,  # 多轮交互：向用户提问
+            "ask_user": result.ask_user,
             "quota_used": result.metadata.get("quota_used", 0),
             "quota_limit": result.metadata.get("quota_limit", 0),
         }
 
-    def _run_tools_parallel(self, tool_calls: list, step: int) -> list[dict]:
-        """
-        多线程并行执行一批工具调用（供 run() 使用）
-
-        改进：先收集所有工具结果，再统一添加到对话历史，
-        避免在线程池回调中逐条保存导致的数据竞争。
-        最后批量保存一次，提升性能和数据一致性。
-
-        Args:
-            tool_calls: tool_call 字典列表
-            step: 当前 ReAct 步数
-
-        Returns:
-            list[dict]: 每个工具的执行结果字典
-        """
-        # ---- 第 1 步：并行执行所有工具，收集结果 ----
-        collected = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(tool_calls)) as executor:
-            future_to_tc = {
-                executor.submit(self._execute_single_tool_sync, tc, step): tc
-                for tc in tool_calls
-            }
-            for future in concurrent.futures.as_completed(future_to_tc):
-                try:
-                    data = future.result()
-                except Exception as e:
-                    tc = future_to_tc[future]
-                    data = {
-                        "tc_id": tc.get("id", ""),
-                        "func_name": tc.get("function", {}).get("name", "?"),
-                        "func_args": tc.get("function", {}).get("arguments", "{}"),
-                        "success": False,
-                        "result_text": f"工具执行线程异常: {e}",
-                        "elapsed_ms": 0,
-                        "truncated": False,
-                        "error": str(e),
-                        "tool_not_found": False,
-                    }
-
-                # 记录 trace 日志
-                self.trace.log_tool_call(data["func_name"], data["func_args"], step)
-                self.trace.log_tool_result(
-                    data["func_name"], data["success"], data["result_text"], step,
-                    elapsed_ms=data["elapsed_ms"],
-                    truncated=data["truncated"],
-                )
-                collected.append(data)
-
-        # ---- 第 2 步：统一将结果添加到对话历史 ----
-        for data in collected:
-            self.session.add_message("tool", data["result_text"], tool_call_id=data["tc_id"])
-
-        # ---- 第 3 步：批量保存一次 ----
-        self._save()
-
-        return collected
-
-    def _save(self) -> None:
-        """保存当前会话状态（线程安全，带锁）"""
-        with self._save_lock:
+    async def _save(self) -> None:
+        """保存当前会话状态（异步安全，带锁）"""
+        async with self._save_lock:
             self.session_manager.save_session(self.session)
             self.trace.log_system(f"会话已保存: {self.session.session_id}")
 
-    def save_session(self) -> None:
+    async def save_session(self) -> None:
         """
-        公开的会话保存方法（供外部调用）
+        公开的会话保存方法（异步版本，供外部调用）
 
         用于 main.py 中在切换/新建/退出会话前确保数据持久化。
         """
-        self._save()
+        await self._save()
 
     def _init_todo_scope(self, user_dir: Path):
         """设置 todo_manager 的用户作用域，任务数据存储到 user_dir/task/（向后兼容）"""
