@@ -360,72 +360,84 @@ class AgentRuntime:
 
                 # ============================================================
                 # 异步并发执行所有工具调用 + 流式事件输出
-                # 使用 asyncio.as_completed 按完成顺序输出结果
+                # 使用 asyncio.wait(FIRST_COMPLETED) 替代 as_completed，
+                # 避免 as_completed 内部 _wait_for_one 协程悬挂导致 RuntimeWarning
                 # ============================================================
-                tasks = {
+                task_map = {
                     asyncio.create_task(
                         self._execute_single_tool_async(tc, step)
                     ): tc for tc in tool_calls
                 }
 
-                for coro in asyncio.as_completed(tasks):
-                    tc = tasks[coro]
-                    try:
-                        data = await coro
-                    except Exception as e:
-                        data = {
-                            "tc_id": tc.get("id", ""),
-                            "func_name": tc.get("function", {}).get("name", "?"),
-                            "func_args": tc.get("function", {}).get("arguments", "{}"),
-                            "success": False,
-                            "result_text": f"工具执行异步任务异常: {e}",
-                            "elapsed_ms": 0,
-                            "truncated": False,
-                            "error": str(e),
-                            "tool_not_found": False,
-                        }
-
-                    # 记录 trace 日志
-                    self.trace.log_tool_call(data["func_name"], data["func_args"], step)
-                    self.trace.log_tool_result(
-                        data["func_name"], data["success"], data["result_text"], step,
-                        elapsed_ms=data["elapsed_ms"],
-                        truncated=data["truncated"],
+                pending = set(task_map.keys())
+                while pending:
+                    done, pending = await asyncio.wait(
+                        pending, return_when=asyncio.FIRST_COMPLETED
                     )
+                    for coro in done:
+                        tc = task_map[coro]
+                        try:
+                            data = await coro
+                        except Exception as e:
+                            data = {
+                                "tc_id": tc.get("id", ""),
+                                "func_name": tc.get("function", {}).get("name", "?"),
+                                "func_args": tc.get("function", {}).get("arguments", "{}"),
+                                "success": False,
+                                "result_text": f"工具执行异步任务异常: {e}",
+                                "elapsed_ms": 0,
+                                "truncated": False,
+                                "error": str(e),
+                                "tool_not_found": False,
+                            }
 
-                    # 将工具结果添加到对话历史
-                    self.session.add_message("tool", data["result_text"], tool_call_id=data["tc_id"])
+                        # 记录 trace 日志
+                        self.trace.log_tool_call(data["func_name"], data["func_args"], step)
+                        self.trace.log_tool_result(
+                            data["func_name"], data["success"], data["result_text"], step,
+                            elapsed_ms=data["elapsed_ms"],
+                            truncated=data["truncated"],
+                        )
 
-                    # 流式事件：先输出工具调用信息，再输出结果
-                    yield {"type": "tool_call", "data": {"tool": data["func_name"], "args": data["func_args"]}}
-                    yield {
-                        "type": "tool_result",
-                        "data": {
-                            "tool": data["func_name"],
-                            "success": data["success"],
-                            "result": data["result_text"][:300],
-                        },
-                    }
+                        # 将工具结果添加到对话历史
+                        self.session.add_message("tool", data["result_text"], tool_call_id=data["tc_id"])
 
-                    # ============================================================
-                    # 多轮交互：工具需要向用户提问
-                    # ============================================================
-                    ask_question = data.get("ask_user")
-                    if ask_question:
-                        self.trace.log_system(f"工具请求用户输入: {ask_question}")
+                        # 流式事件：先输出工具调用信息，再输出结果
+                        yield {"type": "tool_call", "data": {"tool": data["func_name"], "args": data["func_args"]}}
                         yield {
-                            "type": "ask_user",
+                            "type": "tool_result",
                             "data": {
                                 "tool": data["func_name"],
-                                "question": ask_question,
+                                "success": data["success"],
+                                "result": data["result_text"][:300],
                             },
                         }
-                        # 此时流结束，下一轮用户输入会作为答案
-                        yield {"type": "done"}
-                        return
 
-                    # 每次工具结果写入后立即持久化会话
-                    await self._save()
+                        # ============================================================
+                        # 多轮交互：工具需要向用户提问
+                        # ============================================================
+                        ask_question = data.get("ask_user")
+                        if ask_question:
+                            self.trace.log_system(f"工具请求用户输入: {ask_question}")
+                            yield {
+                                "type": "ask_user",
+                                "data": {
+                                    "tool": data["func_name"],
+                                    "question": ask_question,
+                                },
+                            }
+                            # 取消其余未完成的任务
+                            for t in pending:
+                                t.cancel()
+                            # 等待被取消的任务真正完成清理
+                            if pending:
+                                await asyncio.wait(pending)
+                            # 此时流结束，下一轮用户输入会作为答案
+                            yield {"type": "done"}
+                            return
+
+                        # 每次工具结果写入后立即持久化会话
+                        await self._save()
 
                 # 继续循环，让 LLM 根据工具结果继续推理
                 continue
