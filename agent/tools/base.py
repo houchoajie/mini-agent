@@ -30,13 +30,11 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 import json
 import time
 import hashlib
 import importlib
-import asyncio
-import concurrent.futures
 from functools import wraps
 from pathlib import Path
 from agent import config
@@ -857,19 +855,14 @@ class BaseTool(ABC):
         self,
         arguments: str | dict,
         context: ToolContext | None = None,
-        *,
-        _sync_execute: Callable[..., ToolResult] | None = None,
     ) -> ToolResult:
         """
-        安全执行工具 — 异步入口（也是完整流水线的唯一实现）。
+        安全执行工具 — 异步入口。
 
         流水线阶段：
         1. 参数解析 → 2. 参数校验 → 3-4. before_execute 钩子（工具级+全局）
-        5. 配额检查 → 6. 缓存检查 → 7. 核心执行
+        5. 配额检查 → 6. 缓存检查 → 7. 核心执行（异步）
         8. 缓存写入 → 9-10. after_execute 钩子 → 11. 结果截断 → 12. 配额记录
-
-        _sync_execute 是内部参数，由 safe_execute() 传入 self.execute，
-        此时走同步路径；不传则走 self.execute_async() 异步路径。
         """
         # 设置上下文
         if context is not None:
@@ -942,11 +935,8 @@ class BaseTool(ABC):
                     cached.metadata["cached"] = True
                     return cached
 
-            # ---- 7. 核心执行（分支：同步/异步） ----
-            if _sync_execute is not None:
-                result = _sync_execute(**cleaned)              # 同步路径
-            else:
-                result = await self.execute_async(**cleaned)   # 异步路径
+            # ---- 7. 核心执行（异步） ----
+            result = await self.execute_async(**cleaned)
 
             # ---- 8. 缓存写入 ----
             if cache and result.success:
@@ -1053,27 +1043,184 @@ class BaseTool(ABC):
         """
         安全执行工具 — 同步入口。
 
-        委托给 safe_execute_async，传入 _sync_execute=self.execute 走同步路径。
-        如果当前已在 asyncio 事件循环中，自动用线程池绕开，
-            避免 "asyncio.run() cannot be called from a running event loop" 错误。
+        流水线阶段：
+        1. 参数解析 → 2. 参数校验 → 3-4. before_execute 钩子（工具级+全局）
+        5. 配额检查 → 6. 缓存检查 → 7. 核心执行（同步）
+        8. 缓存写入 → 9-10. after_execute 钩子 → 11. 结果截断 → 12. 配额记录
         """
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
+        # 设置上下文
+        if context is not None:
+            self._context = context
+        ctx = self.get_context()
 
-        if loop and loop.is_running():
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(
-                    lambda: asyncio.run(
-                        self.safe_execute_async(arguments, context, _sync_execute=self.execute)
-                    )
+        try:
+            # ---- 1. 参数解析 ----
+            if isinstance(arguments, str):
+                args_dict = json.loads(arguments) if arguments.strip() else {}
+            else:
+                args_dict = arguments
+
+            # ---- 2. 参数校验 ----
+            cleaned, errors = self._validate_params(self.parameters, args_dict)
+            if errors:
+                return ToolResult(
+                    success=False,
+                    result="",
+                    error=f"[{ErrorCode.INVALID_PARAMS}] 参数校验失败:\n"
+                          + "\n".join(f"  - {e}" for e in errors),
+                    metadata={"error_code": ErrorCode.INVALID_PARAMS, "validation_errors": errors},
                 )
-                return future.result()
-        else:
-            return asyncio.run(
-                self.safe_execute_async(arguments, context, _sync_execute=self.execute)
+
+            # ---- 3. before_execute 钩子（工具级） ----
+            try:
+                hook_result = self.before_execute(cleaned, ctx)
+            except ToolError as e:
+                return e.to_tool_result()
+            if isinstance(hook_result, ToolResult):
+                return hook_result
+            if isinstance(hook_result, dict):
+                cleaned = hook_result
+
+            # ---- 4. before_execute 钩子（全局注册表） ----
+            try:
+                global_hook_result = HOOKS.run_before(self.name, ctx, cleaned)
+            except ToolError as e:
+                return e.to_tool_result()
+            if isinstance(global_hook_result, ToolResult):
+                return global_hook_result
+            if isinstance(global_hook_result, dict):
+                cleaned = global_hook_result
+
+            # ---- 5. 配额检查 ----
+            if self.quota_limit > 0:
+                estimated = self.max_result_tokens if self.max_result_tokens > 0 else 0
+                if not self._check_quota(estimated):
+                    return ToolResult(
+                        success=False,
+                        result="",
+                        error=(
+                            f"[{ErrorCode.RATE_LIMITED}] 工具 '{self.name}' 的 token 配额已耗尽"
+                            f"（已用: {self._quota_used}, 限额: {self.quota_limit}）。"
+                            f"如需继续使用，请调整该工具的 quota_limit 设置或开始新会话。"
+                        ),
+                        metadata={
+                            "error_code": ErrorCode.RATE_LIMITED,
+                            "quota_used": self._quota_used,
+                            "quota_limit": self.quota_limit,
+                            "tool_name": self.name,
+                        },
+                    )
+
+            # ---- 6. 缓存检查 ----
+            cache = self._get_cache()
+            if cache:
+                cached = cache.get(cleaned)
+                if cached is not None:
+                    cached.metadata["cached"] = True
+                    return cached
+
+            # ---- 7. 核心执行（同步） ----
+            result = self.execute(**cleaned)
+
+            # ---- 8. 缓存写入 ----
+            if cache and result.success:
+                cache.set(cleaned, result)
+
+            # ---- 9. after_execute 钩子（工具级） ----
+            try:
+                after_result = self.after_execute(result, ctx)
+                if isinstance(after_result, ToolResult):
+                    result = after_result
+            except ToolError as e:
+                return e.to_tool_result()
+
+            # ---- 10. after_execute 钩子（全局注册表） ----
+            try:
+                global_after = HOOKS.run_after(self.name, ctx, result)
+                if isinstance(global_after, ToolResult):
+                    result = global_after
+            except ToolError as e:
+                return e.to_tool_result()
+
+            # ---- 11. 结果截断保护 ----
+            if result.success:
+                if self.max_result_tokens > 0:
+                    warn = config.is_token_truncate_warn_enabled()
+                    truncated = config.truncate_by_tokens(
+                        result.result, self.max_result_tokens, warn=warn,
+                    )
+                    if truncated != result.result:
+                        result.result = truncated
+                        result.metadata["truncated"] = True
+
+                if self.max_result_chars > 0 and len(result.result) > self.max_result_chars:
+                    truncated = result.result[:self.max_result_chars]
+                    last_newline = truncated.rfind("\n")
+                    if last_newline > 0:
+                        truncated = truncated[:last_newline]
+                    elif last_newline == 0:
+                        truncated = ""
+
+                    total_lines = result.result.count("\n") + 1
+                    shown_lines = truncated.count("\n") + 1 if truncated else 0
+
+                    if result.continuation:
+                        hint = result.continuation.get("hint", "")
+                        result.result = truncated + (
+                            f"\n\n[...结果过长，已截断为前 {self.max_result_chars} 字符，"
+                            f"当前显示 {shown_lines}/{total_lines} 行。\n"
+                            f"{hint}]"
+                        )
+                    else:
+                        result.result = truncated + (
+                            f"\n\n[...结果过长，已截断为前 {self.max_result_chars} 字符，"
+                            f"当前显示 {shown_lines}/{total_lines} 行，"
+                            f"完整结果共 {len(result.result)} 字符。\n"
+                            f"该工具不支持分页读取，被截断的部分无法继续获取。]"
+                        )
+                    result.metadata["truncated"] = True
+
+            # ---- 12. 配额用量记录 ----
+            if result.success:
+                used = config.get_estimated_tokens(result.result)
+                self._add_quota_usage(used)
+                result.metadata["quota_used"] = self._quota_used
+                if self.quota_limit > 0:
+                    result.metadata["quota_limit"] = self.quota_limit
+
+            return result
+
+        except json.JSONDecodeError as e:
+            return ToolResult(
+                success=False,
+                result="",
+                error=f"[{ErrorCode.INVALID_PARAMS}] 参数解析失败: {e}",
+                metadata={"error_code": ErrorCode.INVALID_PARAMS},
             )
+        except TypeError as e:
+            return ToolResult(
+                success=False,
+                result="",
+                error=f"[{ErrorCode.INVALID_PARAM_TYPE}] 参数类型错误: {e}",
+                metadata={"error_code": ErrorCode.INVALID_PARAM_TYPE},
+            )
+        except ToolError as e:
+            try:
+                on_error_result = self.on_error(e, ctx)
+                if isinstance(on_error_result, ToolResult):
+                    return on_error_result
+                global_error = HOOKS.run_on_error(self.name, ctx, e)
+                if isinstance(global_error, ToolResult):
+                    return global_error
+            except Exception:
+                pass
+            return e.to_tool_result()
+        except Exception as e:
+            tool_error = ToolError(
+                ErrorCode.EXECUTION_ERROR,
+                f"{type(e).__name__}: {e}",
+            )
+            return tool_error.to_tool_result()
 
     def clear_cache(self):
         """手动清空工具缓存。"""
