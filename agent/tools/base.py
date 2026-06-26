@@ -1038,6 +1038,7 @@ class BaseTool(ABC):
             )
             return tool_error.to_tool_result()
 
+    # 简单工具调用同步方法，会减少开销
     def safe_execute(self, arguments: str | dict,
                      context: ToolContext | None = None) -> ToolResult:
         """
