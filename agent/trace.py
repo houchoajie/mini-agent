@@ -119,13 +119,21 @@ class TraceLogger:
 
         文件写入使用追加模式（"a"），符合 JSONL 格式要求。
         每行末尾的换行符确保文件可被逐行读取。
+
+        错误处理：
+        写入日志文件失败不会影响主流程——trace 模块只负责记录，
+        不应对调用方产生副作用。因此所有 IO 异常在此被吞掉并打印警告。
         """
         entry["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         self._entries.append(entry)
 
         # 追加写入 JSONL 文件
-        with open(self.log_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        # 写入失败不抛异常，只打印警告（trace 日志不能阻塞主流程）
+        try:
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except (IOError, OSError, TypeError, ValueError) as e:
+            self._print(f"⚠️ [TRACE] 日志写入失败: {e}")
 
     def log_system(self, message: str) -> None:
         """记录系统级事件（如初始化完成、会话切换、记忆压缩等）。"""
@@ -153,7 +161,7 @@ class TraceLogger:
             "message_count": msg_count,
             "tool_count": tool_count,
             "messages_summary": [
-                {"role": m.get("role"), "content_preview": str(m.get("content", ""))[:100]}
+                {"role": m.get("role"), "content_preview": str(m.get("content", ""))[:500]}
                 for m in messages
             ],
         })
@@ -167,13 +175,14 @@ class TraceLogger:
             usage: token 使用统计（prompt_tokens, completion_tokens, total_tokens）
         """
         has_tool_calls = response.get("tool_calls") is not None
-        content_preview = (response.get("content") or "")[:200]
+        content_text = response.get("content") or ""
+        content_preview = content_text[:2000]
 
         if has_tool_calls:
             tool_names = [tc["function"]["name"] for tc in response["tool_calls"]]
             self._print(f"🤖 [LLM←响应] 请求调用工具: {', '.join(tool_names)}")
         else:
-            self._print(f"🤖 [LLM←响应] 文本回复: {content_preview[:80]}...")
+            self._print(f"🤖 [LLM←响应] 文本回复: {content_text}")
 
         if usage:
             self._print(f"   Token 使用: {usage.get('total_tokens', '?')} (prompt: {usage.get('prompt_tokens', '?')}, completion: {usage.get('completion_tokens', '?')})")
@@ -194,8 +203,8 @@ class TraceLogger:
             arguments: 调用参数（JSON 字符串或字典）
             step: 当前 ReAct 步数
         """
-        args_preview = str(arguments)[:200]
-        self._print(f"🔨 [TOOL→调用] Step {step}: {tool_name}({args_preview})")
+        args_str = str(arguments)
+        self._print(f"🔨 [TOOL→调用] Step {step}: {tool_name}({args_str})")
         self._write_entry({
             "level": "tool_call",
             "step": step,
@@ -217,17 +226,16 @@ class TraceLogger:
             truncated: 结果是否被截断
         """
         status = "✅" if success else "❌"
-        result_preview = result[:200]
         time_info = f" [{elapsed_ms:.0f}ms]" if elapsed_ms else ""
         trunc_info = " [截断]" if truncated else ""
 
-        self._print(f"{status} [TOOL←结果] Step {step}: {tool_name}{time_info}{trunc_info} → {result_preview}")
+        self._print(f"{status} [TOOL←结果] Step {step}: {tool_name}{time_info}{trunc_info} → {result}")
         self._write_entry({
             "level": "tool_result",
             "step": step,
             "tool_name": tool_name,
             "success": success,
-            "result_preview": result_preview,
+            "result_preview": result[:2000],
             "elapsed_ms": elapsed_ms,
             "truncated": truncated,
         })

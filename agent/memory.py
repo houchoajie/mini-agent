@@ -95,9 +95,9 @@ class ConversationMemory:
         non_system = [m for m in messages if m.get("role") != "system"]
         return len(non_system) > self.max_messages
 
-    def compress(self, messages: list[dict], llm=None) -> list[dict]:
+    async def compress(self, messages: list[dict], llm=None) -> list[dict]:
         """
-        压缩消息历史（扁平摘要模式）。
+        压缩消息历史（扁平摘要模式）— 异步版本。
 
         压缩流程：
         1. 分离原始 system 消息和已有的历史摘要
@@ -168,7 +168,7 @@ class ConversationMemory:
         # ---- 第 4 步：生成新的扁平摘要 ----
         max_len = self._get_summary_max_length()
 
-        new_summary = self._generate_summary(
+        new_summary = await self._generate_summary(
             old_text=old_text,
             max_length=max_len,
             llm=llm,
@@ -230,7 +230,7 @@ class ConversationMemory:
         """
         return self.SUMMARY_LENGTH
 
-    def _generate_summary(
+    async def _generate_summary(
         self,
         old_text: str,
         max_length: int,
@@ -257,7 +257,7 @@ class ConversationMemory:
         if llm:
             prompt = self._build_summary_prompt(old_text, max_length, existing_summary)
             try:
-                response = llm.chat(
+                response = await llm.chat_async(
                     messages=[{"role": "user", "content": prompt}],
                     tools=None,  # 摘要不需要工具
                 )

@@ -11,28 +11,23 @@ LLM 客户端 — 封装 OpenAI（及兼容 API）的 Chat Completions 调用
 
 设计的核心考量：
 - 对上层（Runtime）屏蔽 API 差异：无论是 OpenAI、DeepSeek 还是
-  其他兼容服务，Runtime 看到的都是统一的 chat() / chat_stream() 接口
+  其他兼容服务，Runtime 看到的都是统一的 chat_async() / chat_stream_detect_tools_async() 接口
 - 失败有兜底：网络波动、限流等瞬态异常由重试机制自动处理
 - Token 统计：每次调用记录 token 用量，供限额检查和审计
 
 使用示例：
     llm = LLMClient()
-    response = llm.chat(
+    response = await llm.chat_async(
         messages=[{"role": "user", "content": "你好"}],
         tools=[{"type": "function", ...}],
     )
     # response = {"role": "assistant", "content": "...", "tool_calls": [...]}
-
-流式模式：
-    for chunk in llm.chat_stream(messages):
-        print(chunk, end="", flush=True)  # 逐 token 打印
 """
 
 import os
 import json
-import time
 import asyncio
-from openai import OpenAI, AsyncOpenAI
+from openai import AsyncOpenAI
 from agent.trace import TraceLogger
 from agent import config
 
@@ -51,7 +46,7 @@ class LLMClient:
     4. 便于单测时 mock
 
     Attributes:
-        client: OpenAI SDK 客户端实例
+        async_client: AsyncOpenAI SDK 客户端实例
         model: 使用的模型名称（如 gpt-4o-mini, deepseek-chat）
         trace: 日志追踪器（记录每次调用的请求/响应）
         last_usage: 最近一次 API 调用的 token 使用统计
@@ -87,15 +82,9 @@ class LLMClient:
         self.trace = trace or TraceLogger()
         self.timeout = timeout or float(os.getenv("LLM_TIMEOUT", "60"))
 
-        # 初始化 OpenAI SDK 客户端（同步 + 异步）
+        # 初始化 OpenAI SDK 异步客户端
         # max_retries=0：关闭 SDK 内置重试，使用自定义重试逻辑
         # 为什么：SDK 的重试策略不可定制，自实现可以控制退避策略和日志
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url,
-            timeout=self.timeout,
-            max_retries=0,
-        )
         self.async_client = AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
@@ -111,92 +100,52 @@ class LLMClient:
         # 最后一次调用的 token 使用统计，供 Runtime 做限额检查
         self.last_usage: dict | None = None
 
-    def chat(
+
+    # 主要用于记忆压缩
+    async def chat_async(
         self,
         messages: list[dict],
         tools: list[dict] | None = None,
         max_retries: int = 3,
     ) -> dict:
         """
-        发送聊天请求到 LLM（同步模式，带自动重试）。
+        发送聊天请求到 LLM（异步模式，带自动重试）。
 
-        核心方法：将对话历史和工具定义发送给 LLM，获取响应。
-        失败时采用指数退避策略自动重试。
-
-        重试策略：
-           第 1 次失败 → 等待 1 秒 → 重试
-           第 2 次失败 → 等待 2 秒 → 重试
-           第 3 次失败 → 等待 4 秒 → 重试
-           全部失败 → 抛出最后一个异常
-
-        为什么用指数退避：
-        - 网络抖动/限流通常是瞬时的，短暂等待后可恢复
-        - 线性重试在连续失败时浪费等待时间
-        - 指数退避在早期快速重试，后期拉长间隔给服务恢复时间
+        与 chat() 功能完全相同，但使用 AsyncOpenAI 客户端，
+        支持在 asyncio 事件循环中非阻塞执行。
 
         Args:
-            messages: 对话消息列表，遵循 OpenAI Chat API 格式：
-                [
-                    {"role": "system", "content": "系统提示"},
-                    {"role": "user", "content": "用户消息"},
-                    {"role": "assistant", "content": "...", "tool_calls": [...]},
-                    {"role": "tool", "tool_call_id": "xxx", "content": "结果"},
-                ]
-            tools: 工具定义列表（OpenAI function calling schema），可选。
-                   传 None 则 LLM 只能文本回复。
+            messages: 对话消息列表
+            tools: 工具定义列表（可选）
             max_retries: 最大重试次数，默认 3
 
         Returns:
-            LLM 响应消息字典：
-            {
-                "role": "assistant",
-                "content": "文本回复（工具调用时可能为 None）",
-                "tool_calls": [...]  # 工具调用请求列表（可能为 None）
-            }
-
-        Raises:
-            Exception: 所有重试均失败后抛出最后一个异常
+            LLM 响应消息字典，格式同 chat()
         """
         self.trace.log_llm_request(messages, tools)
 
-        # 【修复】不传 max_tokens，由模型自行控制回复长度
-        # 之前传 max_tokens=4096 会导致 DashScope/DeepSeek 等兼容 API
-        # 在模型输出窗口较小时静默截断回复，且不通知调用方
-        # 移除后模型会生成到自然结束（finish_reason="stop"）
-
-        # 构建 API 请求参数
-        # 参数只需构建一次，重试时复用（因为 messages 和 tools 不变）
         kwargs: dict = {
             "model": self.model,
             "messages": messages,
             "temperature": 0.7,
         }
-        if max_tokens is not None:
-            kwargs["max_tokens"] = max_tokens
         if tools:
             kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"  # 让 LLM 自行决定是否调用工具
+            kwargs["tool_choice"] = "auto"
 
-        # ============================================================
-        # 重试循环：指数退避
-        # ============================================================
         last_exception = None
         for attempt in range(max_retries):
             try:
-                response = self.client.chat.completions.create(**kwargs)
+                response = await self.async_client.chat.completions.create(**kwargs)
                 choice = response.choices[0]
                 message = choice.message
 
-                # 将 OpenAI SDK 的响应对象转为普通字典
-                # 为什么转 dict：上层（Runtime）不依赖 OpenAI SDK，
-                # 用普通 dict 更通用、易测试
                 result = {
                     "role": "assistant",
                     "content": message.content,
                     "tool_calls": None,
                 }
 
-                # 处理工具调用请求（function calling）
                 if message.tool_calls:
                     result["tool_calls"] = []
                     for tc in message.tool_calls:
@@ -209,7 +158,6 @@ class LLMClient:
                             },
                         })
 
-                # 记录 token 使用统计
                 usage = {
                     "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
                     "completion_tokens": response.usage.completion_tokens if response.usage else 0,
@@ -223,21 +171,22 @@ class LLMClient:
             except Exception as e:
                 last_exception = e
                 if attempt < max_retries - 1:
-                    # 指数退避：1s, 2s, 4s
                     wait_time = 2 ** attempt
                     self.trace.log_error(
-                        f"LLM API 调用失败 (第 {attempt + 1}/{max_retries} 次), "
+                        f"LLM 异步 API 调用失败 (第 {attempt + 1}/{max_retries} 次), "
                         f"{wait_time}s 后重试: {type(e).__name__}: {e}"
                     )
-                    time.sleep(wait_time)
+                    await asyncio.sleep(wait_time)
                 else:
                     self.trace.log_error(
-                        f"LLM API 调用最终失败 (已重试 {max_retries} 次): "
+                        f"LLM 异步 API 调用最终失败 (已重试 {max_retries} 次): "
                         f"{type(e).__name__}: {e}"
                     )
 
         raise last_exception
 
+    # 逐文本推送，记忆压缩时不需要，只需要模型结果
+    # 异步聊天 + 工具调用检测（只测不用）
     async def chat_stream_detect_tools_async(
         self,
         messages: list[dict],

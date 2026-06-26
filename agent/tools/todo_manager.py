@@ -51,7 +51,10 @@ class TodoManagerTool(BaseTool):
     def set_user_dir(self, user_dir: Path):
         """设置用户目录，任务数据将存储到 user_dir/task/。"""
         self._user_dir = user_dir
-        (user_dir / "task").mkdir(parents=True, exist_ok=True)
+        try:
+            (user_dir / "task").mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError) as e:
+            raise RuntimeError(f"无法创建任务数据目录: {e}")
 
     @property
     def name(self) -> str:
@@ -151,7 +154,10 @@ class TodoManagerTool(BaseTool):
         """获取并确保任务目录存在。"""
         user_dir = self._resolve_user_dir()
         task_dir = user_dir / "task"
-        task_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            task_dir.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError) as e:
+            raise RuntimeError(f"无法访问任务数据目录: {e}")
         return task_dir
 
     def _get_todo_file(self) -> Path:
@@ -189,7 +195,10 @@ class TodoManagerTool(BaseTool):
         """
         lock_file = self._get_lock_file()
         data_dir = self._get_data_dir()
-        data_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            data_dir.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError):
+            return False
 
         start = time.time()
         while time.time() - start < timeout:
@@ -199,13 +208,13 @@ class TodoManagerTool(BaseTool):
                 return True
             except FileExistsError:
                 # 检查锁文件是否过期（超过 10 秒的锁视为过期）
-                if lock_file.exists():
-                    age = time.time() - lock_file.stat().st_mtime
-                    if age > 10:
-                        try:
+                try:
+                    if lock_file.exists():
+                        age = time.time() - lock_file.stat().st_mtime
+                        if age > 10:
                             lock_file.unlink()
-                        except OSError:
-                            pass
+                except (OSError, PermissionError):
+                    pass
                 time.sleep(0.05)
 
         return False

@@ -30,6 +30,8 @@
 """
 
 import json
+import os
+import sys
 import hashlib
 import secrets
 from pathlib import Path
@@ -82,9 +84,18 @@ class UserManager:
 
     def _save(self):
         """保存用户数据到 JSON 文件。"""
-        with open(USER_FILE, "w", encoding="utf-8") as f:
-            json.dump({"users": self._users, "version": 1}, f,
-                      ensure_ascii=False, indent=2)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            # 先写临时文件再原子替换，防止写入中途崩溃导致文件损坏
+            tmp_file = USER_FILE.with_suffix(".json.tmp")
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump({"users": self._users, "version": 1}, f,
+                          ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_file.replace(USER_FILE)  # 原子替换
+        except (IOError, OSError, json.JSONEncodeError) as e:
+            print(f"❌ [USER] 用户数据保存失败: {e}", file=sys.stderr)
 
     def _hash_password(self, password: str, salt: str | None = None) -> str:
         """
@@ -143,9 +154,13 @@ class UserManager:
         self._save()
 
         # 创建用户目录结构（session/log/task 子目录）
-        user_dir = self.get_user_dir(username)
-        for sub in ["session", "log", "task"]:
-            (user_dir / sub).mkdir(parents=True, exist_ok=True)
+        try:
+            user_dir = self.get_user_dir(username)
+            for sub in ["session", "log", "task"]:
+                (user_dir / sub).mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError) as e:
+            # 目录创建失败不影响注册结果，但打印警告
+            print(f"⚠️ [USER] 用户目录创建失败 ({username}): {e}", file=sys.stderr)
 
         return True, "注册成功"
 

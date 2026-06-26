@@ -324,6 +324,9 @@ class FileReaderTool(BaseTool):
         Returns:
             list[str]: 结构标记行列表（最多返回 30 条，防止结果过大）
         """
+        if not lines:
+            return []
+
         suffix = path.suffix.lower()
         markers = []
         seen = set()

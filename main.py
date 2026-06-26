@@ -88,11 +88,19 @@ def login_loop(user_manager: UserManager) -> str:
         print("1. 登录")
         print("2. 注册")
         print("3. 退出")
-        choice = input("请选择: ").strip()
+        try:
+            choice = input("请选择: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n👋 再见！")
+            sys.exit(0)
 
         if choice == "1":
-            username = input("用户名: ").strip()
-            password = input("密码: ").strip()
+            try:
+                username = input("用户名: ").strip()
+                password = input("密码: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n👋 再见！")
+                sys.exit(0)
             ok, msg = user_manager.login(username, password)
             if ok:
                 print(f"✅ 登录成功！欢迎 {username}")
@@ -100,8 +108,12 @@ def login_loop(user_manager: UserManager) -> str:
             print(f"❌ {msg}")
 
         elif choice == "2":
-            username = input("用户名: ").strip()
-            password = input("密码: ").strip()
+            try:
+                username = input("用户名: ").strip()
+                password = input("密码: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n👋 再见！")
+                sys.exit(0)
             ok, msg = user_manager.register(username, password)
             print(f"{'✅' if ok else '❌'} {msg}")
 

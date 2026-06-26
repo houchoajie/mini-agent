@@ -346,10 +346,16 @@ class _ToolCache:
         timestamp, result = self._cache[key]
         if time.time() - timestamp > self._ttl:
             del self._cache[key]
-            self._lru_order.remove(key)
+            try:
+                self._lru_order.remove(key)
+            except ValueError:
+                pass  # LRU 顺序异常时不做处理，不影响缓存功能
             return None
         # 更新 LRU 顺序（移到末尾，表示最近使用过）
-        self._lru_order.remove(key)
+        try:
+            self._lru_order.remove(key)
+        except ValueError:
+            pass  # LRU 顺序异常时不做处理，不影响缓存功能
         self._lru_order.append(key)
         return result
 

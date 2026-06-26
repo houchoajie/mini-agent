@@ -98,6 +98,7 @@ class AgentRuntime:
         self.max_steps = max_steps
         self.username = username
         self._save_lock = asyncio.Lock()
+        self._tool_semaphore = asyncio.Semaphore(4)  # 最多 4 个工具并发执行
 
         # 获取用户目录
         user_dir = None
@@ -252,6 +253,7 @@ class AgentRuntime:
         """
         流式处理用户输入 — 逐步 yield 事件供前端实时展示（异步流式模式）。
 
+        已删除
         与 run() 的区别：
         - run() 使用非流式 chat()，所有 LLM 调用等待完整响应
         - run_stream() 使用 chat_stream_detect_tools_async()，边输出文本边检测工具调用
@@ -288,11 +290,8 @@ class AgentRuntime:
         # ============================================================
         if self.memory.should_compress(self.session.messages):
             self.trace.log_system("对话历史过长，正在压缩早期消息...")
-            # compress 内部调用 llm.chat()（同步），在线程中执行避免阻塞事件循环
-            loop = asyncio.get_event_loop()
-            compressed = await loop.run_in_executor(
-                None, self.memory.compress, self.session.messages, self.llm
-            )
+            # compress 现已完全异步，直接 await
+            compressed = await self.memory.compress(self.session.messages, self.llm)
             self.session.messages = compressed
             self.trace.log_system(f"压缩完成: {len(compressed)} 条消息")
 
@@ -363,14 +362,24 @@ class AgentRuntime:
                 # 使用 asyncio.wait(FIRST_COMPLETED) 替代 as_completed，
                 # 避免 as_completed 内部 _wait_for_one 协程悬挂导致 RuntimeWarning
                 # ============================================================
-                task_map = {
-                    asyncio.create_task(
-                        self._execute_single_tool_async(tc, step)
-                    ): tc for tc in tool_calls
-                }
+                try:
+                    task_map = {
+                        asyncio.create_task(
+                            self._execute_single_tool_async(tc, step)
+                        ): tc for tc in tool_calls
+                    }
+                except (TypeError, ValueError, RuntimeError) as e:
+                    self.trace.log_error(f"创建工具执行任务失败: {e}")
+                    yield {"type": "error", "data": f"工具调用任务创建失败: {e}"}
+                    self.session.add_message("assistant", f"处理工具调用时出错: {e}")
+                    await self._save()
+                    yield {"type": "done"}
+                    return
 
+                # 获取后台正在执行的任务  完成一个就返回一个
                 pending = set(task_map.keys())
                 while pending:
+                    # 已完成  未完成
                     done, pending = await asyncio.wait(
                         pending, return_when=asyncio.FIRST_COMPLETED
                     )
@@ -409,7 +418,7 @@ class AgentRuntime:
                             "data": {
                                 "tool": data["func_name"],
                                 "success": data["success"],
-                                "result": data["result_text"][:300],
+                                "result": data["result_text"],
                             },
                         }
 
@@ -498,9 +507,12 @@ class AgentRuntime:
         # 获取用户目录
         user_dir = None
         if self.username:
-            from agent.user_manager import UserManager
-            um = UserManager()
-            user_dir = um.get_user_dir(self.username)
+            try:
+                from agent.user_manager import UserManager
+                um = UserManager()
+                user_dir = um.get_user_dir(self.username)
+            except Exception as e:
+                self.trace.log_error(f"获取用户目录失败: {e}")
 
         return ToolContext(
             username=self.username or "",
@@ -566,62 +578,81 @@ class AgentRuntime:
             }
 
         # ================================================================
-        # 查找并执行工具
+        # 查找并执行工具（受信号量限制，最多 4 个并发）
         # ================================================================
-        tool = get_tool_by_name(func_name)
+        try:
+            tool = get_tool_by_name(func_name)
 
-        if tool is None:
-            available = ", ".join(t.name for t in ALL_TOOLS)
+            if tool is None:
+                available = ", ".join(t.name for t in ALL_TOOLS)
+                return {
+                    "tc_id": tc_id,
+                    "func_name": func_name,
+                    "func_args": func_args,
+                    "success": False,
+                    "result_text": f"[TOOL_NOT_FOUND] 未知工具: '{func_name}'。可用工具: {available}",
+                    "elapsed_ms": 0,
+                    "truncated": False,
+                    "error": None,
+                    "tool_not_found": True,
+                }
+
+            # 构建上下文并在信号量限制下异步执行
+            context = self._build_context()
+            async with self._tool_semaphore:
+                result = await execute_async(tool, func_args, context=context)
+
+            # ================================================================
+            # 工具执行后：更新会话级 token 累计用量
+            # ================================================================
+            if result.success:
+                tool_result_tokens = config.get_estimated_tokens(result.result)
+                if tool_result_tokens > 0:
+                    self._total_tokens_used += tool_result_tokens
+                    self.session.add_token_usage(
+                        step=step,
+                        tokens=tool_result_tokens,
+                        label=f"工具结果: {func_name}",
+                        tool_name=func_name,
+                    )
+
+            return {
+                "tc_id": tc_id,
+                "func_name": func_name,
+                "func_args": func_args,
+                "success": result.success,
+                "result_text": result.result if result.success else f"[ERROR] {result.error}",
+                "elapsed_ms": result.metadata.get("elapsed_ms", 0),
+                "truncated": result.metadata.get("truncated", False),
+                "error": None,
+                "tool_not_found": False,
+                "ask_user": result.ask_user,
+                "quota_used": result.metadata.get("quota_used", 0),
+                "quota_limit": result.metadata.get("quota_limit", 0),
+            }
+
+        except Exception as e:
+            self.trace.log_error(f"工具执行异常 [{func_name}]: {e}")
             return {
                 "tc_id": tc_id,
                 "func_name": func_name,
                 "func_args": func_args,
                 "success": False,
-                "result_text": f"[TOOL_NOT_FOUND] 未知工具: '{func_name}'。可用工具: {available}",
+                "result_text": f"[EXECUTION_ERROR] 工具 '{func_name}' 执行异常: {e}",
                 "elapsed_ms": 0,
                 "truncated": False,
-                "error": None,
-                "tool_not_found": True,
+                "error": str(e),
+                "tool_not_found": False,
             }
-
-        # 构建上下文并异步执行
-        context = self._build_context()
-        result = await execute_async(tool, func_args, context=context)
-
-        # ================================================================
-        # 工具执行后：更新会话级 token 累计用量
-        # ================================================================
-        if result.success:
-            tool_result_tokens = config.get_estimated_tokens(result.result)
-            if tool_result_tokens > 0:
-                self._total_tokens_used += tool_result_tokens
-                self.session.add_token_usage(
-                    step=step,
-                    tokens=tool_result_tokens,
-                    label=f"工具结果: {func_name}",
-                    tool_name=func_name,
-                )
-
-        return {
-            "tc_id": tc_id,
-            "func_name": func_name,
-            "func_args": func_args,
-            "success": result.success,
-            "result_text": result.result if result.success else f"[ERROR] {result.error}",
-            "elapsed_ms": result.metadata.get("elapsed_ms", 0),
-            "truncated": result.metadata.get("truncated", False),
-            "error": None,
-            "tool_not_found": False,
-            "ask_user": result.ask_user,
-            "quota_used": result.metadata.get("quota_used", 0),
-            "quota_limit": result.metadata.get("quota_limit", 0),
-        }
 
     async def _save(self) -> None:
         """保存当前会话状态（异步安全，带锁）"""
         async with self._save_lock:
-            self.session_manager.save_session(self.session)
-            self.trace.log_system(f"会话已保存: {self.session.session_id}")
+            saved = self.session_manager.save_session(self.session)
+            if saved:
+                self.trace.log_system(f"会话已保存: {self.session.session_id}")
+            else:
+                self.trace.log_error(f"会话保存失败: {self.session.session_id}")
 
     async def save_session(self) -> None:
         """
@@ -633,10 +664,13 @@ class AgentRuntime:
 
     def _init_todo_scope(self, user_dir: Path):
         """设置 todo_manager 的用户作用域，任务数据存储到 user_dir/task/（向后兼容）"""
-        from agent.tools import get_tool_by_name
-        todo = get_tool_by_name("todo_manager")
-        if todo and hasattr(todo, "set_user_dir") and user_dir:
-            todo.set_user_dir(user_dir)
+        try:
+            from agent.tools import get_tool_by_name
+            todo = get_tool_by_name("todo_manager")
+            if todo and hasattr(todo, "set_user_dir") and user_dir:
+                todo.set_user_dir(user_dir)
+        except Exception as e:
+            self.trace.log_system(f"初始化 todo_manager 作用域失败: {e}")
 
     @staticmethod
     def _reset_all_tool_quotas():
@@ -700,8 +734,8 @@ class AgentRuntime:
                 tn = te.get("tool_name", "")
                 tn_info = f" [{tn}]" if tn else ""
                 lines.append(f"  Step {s}{tn_info}: +{t} (累计: {c})")
-            # 总计
-            last_cumulative = token_entries[-1].get("cumulative", self._total_tokens_used)
+            # 总计（使用 get 安全访问，空列表时显示当前总量）
+            last_cumulative = token_entries[-1].get("cumulative", self._total_tokens_used) if token_entries else self._total_tokens_used
             lines.append(f"  会话累计 Token: {last_cumulative}")
 
         if tool_stats:
@@ -746,11 +780,15 @@ class AgentRuntime:
         Returns:
             切换结果信息
         """
-        loaded = self.session_manager.load_session(session_id)
-        if loaded:
-            self.session = loaded
-            # 切换会话时重置所有工具的配额计数
-            self._reset_all_tool_quotas()
-            self.trace.log_system(f"切换到会话: {session_id}，已重置工具配额")
-            return f"已切换到会话 {session_id}（{len(loaded.messages)} 条消息，工具配额已重置）"
-        return f"会话 {session_id} 不存在"
+        try:
+            loaded = self.session_manager.load_session(session_id)
+            if loaded:
+                self.session = loaded
+                # 切换会话时重置所有工具的配额计数
+                self._reset_all_tool_quotas()
+                self.trace.log_system(f"切换到会话: {session_id}，已重置工具配额")
+                return f"已切换到会话 {session_id}（{len(loaded.messages)} 条消息，工具配额已重置）"
+            return f"会话 {session_id} 不存在"
+        except Exception as e:
+            self.trace.log_error(f"切换会话失败: {e}")
+            return f"切换会话失败: {e}"

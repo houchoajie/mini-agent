@@ -223,6 +223,13 @@ class FileWriterTool(BaseTool):
         - 覆盖模式（append=False）：先写入 .tmp 临时文件，再通过 replace() 原子替换。
           即使中途崩溃，原文件不会被破坏（要么全部成功，要么原文件不变）。
         - 追加模式（append=True）：无法原子化，直接追加到原文件末尾。
+
+        错误处理：
+        - 写入大小超限（>1MB）时抛出 ValueError
+        - 文件写入失败时抛出 IOError/OSError（由调用方 execute() 捕获并返回友好提示）
+
+        Returns:
+            tuple[str, int]: (操作描述, 写入字节数)
         """
         # 检查写入大小限制（1MB）
         content_bytes = len(content.encode("utf-8"))
@@ -232,14 +239,26 @@ class FileWriterTool(BaseTool):
         if append:
             # 追加模式：无法原子操作，直接追加到文件末尾
             # 风险：写入中途崩溃可能导致部分内容丢失，但不会影响已有内容
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(content)
+            try:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(content)
+            except (IOError, OSError) as e:
+                raise IOError(f"追加写入失败: {e}")
             action = "追加"
         else:
             # 覆盖模式：先写临时文件，再原子替换，防止写入中途崩溃导致文件损坏
             tmp_path = path.with_suffix(path.suffix + ".tmp")
-            tmp_path.write_text(content, encoding="utf-8")
-            tmp_path.replace(path)  # 原子替换（Windows 上也是原子的同文件系统操作）
+            try:
+                tmp_path.write_text(content, encoding="utf-8")
+                tmp_path.replace(path)  # 原子替换（Windows 上也是原子的同文件系统操作）
+            except (IOError, OSError) as e:
+                # 清理残留的临时文件
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+                raise IOError(f"覆盖写入失败: {e}")
             action = "写入"
 
         return action, content_bytes

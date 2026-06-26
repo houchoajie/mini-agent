@@ -211,10 +211,13 @@ class SessionManager:
         session.add_message("system", system_prompt)
 
         # 立即保存到文件（确保即使后续出错，会话也已持久化）
-        self.save_session(session)
+        # 保存失败不阻塞创建流程，内存中的 session 仍然可用
+        if not self.save_session(session):
+            print(f"⚠️ [SESSION] 新会话 {session.session_id} 已创建但初次持久化失败", file=__import__('sys').stderr)
+
         return session
 
-    def save_session(self, session: Session) -> None:
+    def save_session(self, session: Session) -> bool:
         """
         保存会话到文件（原子写入）。
 
@@ -227,12 +230,23 @@ class SessionManager:
         - 操作系统可能缓冲写入到内存中，崩溃时丢失数据
         - fsync 强制将缓冲写入磁盘
         - 在 Windows 上 fsync 行为略有不同，但能确保数据离开应用缓冲区
+
+        Returns:
+            True 表示保存成功，False 表示保存失败（调用方应酌情处理）
         """
         path = self._session_path(session.session_id)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(session.to_dict(), f, ensure_ascii=False, indent=2)
-            f.flush()           # 刷新 Python 缓冲区 → OS
-            os.fsync(f.fileno())  # 强制 OS 写入磁盘
+        try:
+            # 先写临时文件，再原子替换，防止写入中途崩溃导致原始文件损坏
+            tmp_path = path.with_suffix(".json.tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(session.to_dict(), f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_path.replace(path)  # 原子替换
+            return True
+        except (IOError, OSError, json.JSONEncodeError) as e:
+            print(f"❌ [SESSION] 会话保存失败: {e}", file=__import__('sys').stderr)
+            return False
 
     def load_session(self, session_id: str) -> Session | None:
         """
@@ -285,10 +299,14 @@ class SessionManager:
     def delete_session(self, session_id: str) -> bool:
         """删除指定会话。返回 True 表示删除成功。"""
         path = self._session_path(session_id)
-        if path.exists():
+        if not path.exists():
+            return False
+        try:
             path.unlink()
             return True
-        return False
+        except (OSError, PermissionError) as e:
+            print(f"❌ [SESSION] 会话删除失败: {e}", file=__import__('sys').stderr)
+            return False
 
     @staticmethod
     def _default_system_prompt() -> str:
